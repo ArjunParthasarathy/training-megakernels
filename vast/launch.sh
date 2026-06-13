@@ -96,13 +96,34 @@ done
 SSH_URL=$(vastai ssh-url "$ID")          # ssh://root@HOST:PORT
 SSH_HOST=$(echo "$SSH_URL" | sed -E 's#ssh://[^@]+@([^:]+):.*#\1#')
 SSH_PORT=$(echo "$SSH_URL" | sed -E 's#.*:([0-9]+)$#\1#')
-SSH=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSH_PORT" "root@$SSH_HOST")
+SSH=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p "$SSH_PORT" "root@$SSH_HOST")
 echo ">> ssh endpoint: root@$SSH_HOST:$SSH_PORT"
 
+# From here on the instance is billing, so any failure should STOP (keep disk) — not
+# destroy — so we can restart + retry without re-renting (see CLAUDE.md). Remember
+# the user's choice, then flip the trap to keep-mode; we restore it only after a
+# clean fetch (so a successful run still destroys unless the user asked to keep).
+KEEP_DEFAULT="${KEEP:-0}"
+KEEP=1
+
+# Wait for sshd + key propagation before rsync. Vast prints the endpoint before the
+# container actually accepts the key, so an immediate rsync hits
+# "Permission denied (publickey)" and set -e would abort. Probe until it answers.
+echo ">> waiting for ssh to accept (key propagation) ..."
+SSH_OK=0
+for _ in $(seq 1 30); do
+  if "${SSH[@]}" -o BatchMode=yes true 2>/dev/null; then SSH_OK=1; break; fi
+  sleep 5
+done
+[[ "$SSH_OK" == "1" ]] || { echo "!! ssh never accepted; instance kept ($ID) for inspection"; exit 1; }
+
 echo ">> uploading repo (megakernels/ + profiling/) ..."
-rsync -az --exclude .venv --exclude .git --exclude results --exclude '__pycache__' \
-  -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $SSH_PORT" \
-  "$REPO_ROOT/" "root@$SSH_HOST:/workspace/repo/"
+for attempt in 1 2 3; do
+  rsync -az --exclude .venv --exclude .git --exclude results --exclude '__pycache__' \
+    -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p $SSH_PORT" \
+    "$REPO_ROOT/" "root@$SSH_HOST:/workspace/repo/" && break
+  echo "   rsync upload attempt $attempt failed; retrying in 5s ..."; sleep 5
+done
 
 echo ">> running nsys (timeline) for variant=$VARIANT on the H100 ..."
 "${SSH[@]}" bash -s <<EOF
@@ -135,9 +156,12 @@ rsync -az -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p
 # Safety net: never destroy a good run before its report is safely local. If no
 # .nsys-rep landed, keep the instance (stop, not destroy) so it can be re-fetched
 # without re-renting — see "Iterating on a bug: restart, don't recreate" in CLAUDE.md.
-if ! ls "$RESULTS_DIR"/*.nsys-rep >/dev/null 2>&1; then
-  echo "!! WARNING: no .nsys-rep fetched to $RESULTS_DIR — forcing KEEP=1 so the"
-  echo "!! instance is STOPPED (disk kept), not destroyed. Re-fetch manually:"
+if ls "$RESULTS_DIR"/*.nsys-rep >/dev/null 2>&1; then
+  echo ">> report fetched OK; restoring KEEP=$KEEP_DEFAULT for teardown"
+  KEEP="$KEEP_DEFAULT"   # clean run: destroy (unless the user asked to keep)
+else
+  echo "!! WARNING: no .nsys-rep fetched to $RESULTS_DIR — keeping instance (KEEP=1) so"
+  echo "!! it is STOPPED (disk kept), not destroyed. Re-fetch without re-renting:"
   echo "!!   vastai start instance $ID && rsync -az -e 'ssh -p <port>' root@<host>:/workspace/out/ $RESULTS_DIR/"
   KEEP=1
 fi
