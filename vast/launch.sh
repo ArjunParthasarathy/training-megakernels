@@ -124,9 +124,23 @@ EOF
 
 echo ">> fetching reports to $RESULTS_DIR ..."
 mkdir -p "$RESULTS_DIR"
-vastai copy "$ID":/workspace/out/ "local:$RESULTS_DIR/" || \
-  rsync -az -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $SSH_PORT" \
-    "root@$SSH_HOST:/workspace/out/" "$RESULTS_DIR/"
+# Pull over the SAME direct SSH that the upload used. NOT `vastai copy`: that goes
+# through Vast's SSH proxy (vastai_kaalia@host:65535), fails publickey, yet exits 0
+# — so it silently fetches nothing. Direct rsync is what works here; vastai copy is
+# only a last-ditch fallback.
+rsync -az -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $SSH_PORT" \
+  "root@$SSH_HOST:/workspace/out/" "$RESULTS_DIR/" \
+  || vastai copy "$ID":/workspace/out/ "local:$RESULTS_DIR/" || true
+
+# Safety net: never destroy a good run before its report is safely local. If no
+# .nsys-rep landed, keep the instance (stop, not destroy) so it can be re-fetched
+# without re-renting — see "Iterating on a bug: restart, don't recreate" in CLAUDE.md.
+if ! ls "$RESULTS_DIR"/*.nsys-rep >/dev/null 2>&1; then
+  echo "!! WARNING: no .nsys-rep fetched to $RESULTS_DIR — forcing KEEP=1 so the"
+  echo "!! instance is STOPPED (disk kept), not destroyed. Re-fetch manually:"
+  echo "!!   vastai start instance $ID && rsync -az -e 'ssh -p <port>' root@<host>:/workspace/out/ $RESULTS_DIR/"
+  KEEP=1
+fi
 
 echo ">> done. Reports in $RESULTS_DIR :"
 ls -lh "$RESULTS_DIR" || true
