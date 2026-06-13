@@ -70,38 +70,71 @@ cd vast && ./launch.sh <variant>        # variant = baseline | modded | dev
 #   e.g.  ./launch.sh modded
 ```
 `launch.sh` does it all: finds the cheapest verified single H100_SXM under
-`MAX_DPH` ($3/hr default), creates it, rsyncs the repo up, installs the cute stack,
-runs **both** `run_nsys.sh <variant>` (timeline) and `run_ncu.sh <variant>`
-(per-kernel), copies `timeline-<variant>.nsys-rep` + `kernels-<variant>.ncu-rep`
-into `results/<variant>-<ts>/`, then **`vastai destroy`** (an EXIT trap, fires even
+`MAX_DPH` ($3/hr default), creates it, **explicitly `vastai start`s it** (Vast often
+creates instances stopped — see below), rsyncs the repo up, installs the cute stack,
+runs `run_nsys.sh <variant>` (timeline), copies `timeline-<variant>.nsys-rep` into
+`results/<variant>-<ts>/`, then **`vastai destroy -y`** (an EXIT trap, fires even
 on error/Ctrl-C; `onstart.sh` also arms a `MAX_LIFETIME_SECS` self-destruct
 watchdog). `KEEP=1 ./launch.sh <variant>` uses `vastai stop` (keep disk) instead.
 
 Open locally (your Nsight version must be ≥ the remote CLI version):
 ```bash
 nsys-ui results/<variant>-<ts>/timeline-<variant>.nsys-rep
-ncu-ui  results/<variant>-<ts>/kernels-<variant>.ncu-rep
 ```
 
-### Profiler: two tools, two jobs
-- kernel launches + bubbles/gaps → Nsight **Systems** (`nsys`, cheap) → `.nsys-rep`
-- warp util + occupancy + memory → Nsight **Compute** (`ncu`, slow, scoped to the
-  `profile_step` NVTX range) → `.ncu-rep`
+### Profiler: nsys timeline only (ncu disabled)
+We profile with Nsight **Systems** only — kernel launches, bubbles/gaps, and
+**host↔device transfers** (HtoD/DtoH memcpy). That's all `-t cuda` tracing, which
+needs **no GPU perf counters**, so it runs on any host. `run_nsys.sh` also prints
+`cuda_gpu_mem_time_sum` / `cuda_gpu_mem_size_sum` so transfer cost shows next to kernels.
 
-`ncu --set full` replays each kernel 30–60×; the harness warms up then captures a
-couple of steps via `--profile` (cudaProfilerApi). `torch.profiler` emits
-Chrome/TensorBoard traces, **not** Nsight reports.
+Nsight **Compute** (`ncu`, per-kernel warp util/occupancy) is **disabled on purpose**
+— and on Vast it's effectively **impossible**, not just inconvenient. ncu needs GPU
+perf counters, which require `NVreg_RestrictProfilingToAdminUsers=0` on the host
+(owner-only: `/etc/modprobe.d` + reboot) **and** container `--cap-add=SYS_ADMIN`. But
+Vast runs renters in **unprivileged containers** and its Docker-Options field exposes
+**only ports/env/hostname — no `--cap-add`, no `--privileged`** (per Vast's Security
+FAQ + Docker-Environment docs). So `ERR_NVGPUCTRPERM` is unavoidable on a normal
+rental; the only escape is a whole-machine/dedicated host whose owner pre-enabled
+counters (~5–10× the cost, not guaranteed, no marketplace filter for it). **For real
+per-kernel counter profiling, use a host you control (Lambda/CoreWeave/own box), not
+Vast.** Do **not** pass `--gpu-metrics-device` to nsys either — same counter wall,
+makes nsys exit with a usage error. `torch.profiler` emits Chrome/TensorBoard traces,
+**not** Nsight reports.
 
-### Billing & ERR_NVGPUCTRPERM
-- `vastai destroy` stops **all** billing (default); `vastai stop` keeps disk and
-  still bills storage. After a run, `vastai show instances` should be empty.
-- `ncu` needs perf counters: host `NVreg_RestrictProfilingToAdminUsers=0` +
-  container `--cap-add=SYS_ADMIN` (Vast Template). Many multi-tenant hosts deny it
-  — prefer verified whole-machine hosts, or fall back to nsys-only (timeline
-  tracing needs no counters).
-- Cold start: NGC image (~10–20 GB, ships ncu+nsys) pulls in ~3–8 min on fast net
+### Iterating on a bug: restart, don't recreate
+When a run fails on a **code/script bug** (not a dead host), don't destroy +
+re-rent — eat the cold start for nothing. Instead **reuse the same instance**:
+launch with `KEEP=1` so the EXIT trap `vastai stop`s (keeps disk + the pulled
+image on that host) instead of destroying, then iterate:
+```bash
+KEEP=1 ./launch.sh <variant>                 # first run; stops (not destroys) at end
+vastai start instance <id>                   # bring it back (seconds — image cached)
+rsync -az ... <repo>/ root@host:/workspace/repo/   # push the code fix
+vastai ssh <id> -- bash profiling/run_nsys.sh <variant> /workspace/out/timeline-<variant>
+vastai destroy instance <id> -y              # only when truly done
+```
+Image layers live in the **host's** Docker cache (per machine), so a restart on the
+same host skips the 3–8 min pull. Caveat: `stop` frees the GPU — restart is
+best-effort (another renter can take it). `destroy -y` when done to stop all billing.
+
+### Billing, the `-y` trap, and the created-stopped gotcha
+- **`vastai destroy` MUST pass `-y`.** Newer vastai prompts `[y/N]`; without `-y`
+  (or `yes |`) the EXIT trap and the onstart watchdog both **abort the destroy and
+  leak billing**. Both call sites now pass `-y`. After a run, `vastai show
+  instances` should be empty — verify it.
+- **Vast often creates instances `stopped`** (intended_status=stopped): the host
+  pulls the image then parks instead of running. `launch.sh` now `vastai start`s
+  explicitly after create and re-nudges if it sees `stopped`, else the wait loop
+  spins forever and SSH fails.
+- `vastai stop` keeps disk and **still bills storage**; `vastai destroy -y` stops
+  **all** billing.
+- `ncu` counter profiling is **not possible on a standard Vast rental** (unprivileged
+  containers; Docker Options expose no caps; host modprobe is owner-only) → we stay
+  nsys-only (timeline + transfers need no counters). See the Profiler section.
+- Cold start: NGC image (~10–20 GB) pulls in ~3–8 min on fast net
   (`inet_down>1000`). Fresh-per-job = cleanest billing; `KEEP=1` (stop) keeps the
-  image cached for fast iteration.
+  image cached on that host for fast restart (see "Iterating on a bug" above).
 
 ## Commit conventions
 End commit messages with the Co-Authored-By trailer. Branch before committing on `main`.

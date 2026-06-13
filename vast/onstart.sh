@@ -19,7 +19,9 @@ echo "options nvidia NVreg_RestrictProfilingToAdminUsers=0" \
 # that Vast injects into every instance. This is the billing safety net.
 ( sleep "$MAX_LIFETIME_SECS"
   pip install -q vastai 2>/dev/null || true
-  vastai destroy instance "$CONTAINER_ID" --api-key "$CONTAINER_API_KEY"
+  # -y is REQUIRED: without it newer vastai prompts [y/N] and the watchdog (no TTY)
+  # would hang forever, defeating the billing backstop. yes| is a belt-and-braces.
+  yes | vastai destroy instance "$CONTAINER_ID" -y --api-key "$CONTAINER_API_KEY"
 ) >/var/log/vast_watchdog.log 2>&1 &
 
 # (3) tools the launcher's SSH run will need

@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # End-to-end Vast.ai H100 profiling launcher:
-#   search cheapest reliable H100  ->  create  ->  wait ready  ->  rsync code up
-#   ->  run nsys + ncu over SSH  ->  copy .nsys-rep/.ncu-rep back  ->  DESTROY.
+#   search cheapest reliable H100  ->  create  ->  start  ->  wait ready  ->  rsync
+#   ->  run nsys (timeline) over SSH  ->  copy .nsys-rep back  ->  DESTROY.
+#
+# ncu (per-kernel) is intentionally DISABLED: the kernels are already optimized;
+# we only care about the timeline (kernel launches, bubbles) and host<->device
+# transfers, both of which nsys captures without GPU perf counters (no SYS_ADMIN
+# needed). To re-enable ncu, restore the run_ncu.sh block below.
 #
 # Destroy at the end stops ALL billing (compute + storage). The onstart watchdog
 # is a second safety net in case this script dies mid-run. After it finishes,
@@ -40,7 +45,9 @@ cleanup() {
       vastai stop instance "$ID" || true
     else
       echo ">> destroying instance $ID (stops all billing)"
-      vastai destroy instance "$ID" || true
+      # -y is REQUIRED: newer vastai prompts [y/N] and would otherwise abort here,
+      # leaking billing. Pipe `yes` too in case an older CLI lacks the flag.
+      yes | vastai destroy instance "$ID" -y || true
     fi
     vastai show instances || true
   fi
@@ -61,12 +68,20 @@ ID=$(MAX_LIFETIME_SECS="${MAX_LIFETIME_SECS:-3600}" \
     --raw | jqpy "['new_contract']")
 echo ">> instance id = $ID"
 
+# Vast often creates the instance in a STOPPED state (intended_status=stopped) when
+# the host can't schedule it instantly — it pulls the image then parks. Explicitly
+# start it so it boots into `running` (idempotent if already running).
+echo ">> starting instance $ID ..."
+vastai start instance "$ID" || true
+
 echo ">> waiting for instance to be running ..."
 for _ in $(seq 1 80); do
   ST=$(vastai show instance "$ID" --raw | jqpy ".get('actual_status')" || echo "?")
   echo "   status=$ST"
   [[ "$ST" == "running" ]] && break
   [[ "$ST" == "exited" || "$ST" == "offline" ]] && { echo "instance died"; exit 1; }
+  # if it parked in stopped/created, nudge it again (start is idempotent)
+  [[ "$ST" == "stopped" ]] && vastai start instance "$ID" || true
   sleep 15
 done
 
@@ -89,18 +104,21 @@ rsync -az --exclude .venv --exclude .git --exclude results --exclude '__pycache_
   -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $SSH_PORT" \
   "$REPO_ROOT/" "root@$SSH_HOST:/workspace/repo/"
 
-echo ">> running nsys + ncu for variant=$VARIANT on the H100 ..."
+echo ">> running nsys (timeline) for variant=$VARIANT on the H100 ..."
 "${SSH[@]}" bash -s <<EOF
 set -e
 cd /workspace/repo
 # GPU-only fused-kernel stack (best-effort: cute backend if it installs, else eager)
 pip install -q nvidia-cutlass-dsl quack-kernels flash-attn-4 >/dev/null 2>&1 || true
-bash profiling/fix_profiling_perms.sh || true
 mkdir -p /workspace/out
 echo "=== nsys (timeline) ==="
 bash profiling/run_nsys.sh "$VARIANT" /workspace/out/timeline-$VARIANT ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} || true
-echo "=== ncu (per-kernel) ==="
-bash profiling/run_ncu.sh "$VARIANT" /workspace/out/kernels-$VARIANT ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} || true
+# ncu (per-kernel) intentionally disabled — see header. It needs GPU perf counters
+# (SYS_ADMIN) which most multi-tenant hosts deny, and we only want the timeline +
+# host<->device transfers. To re-enable, uncomment:
+#   echo "=== ncu (per-kernel) ==="
+#   bash profiling/fix_profiling_perms.sh || true
+#   bash profiling/run_ncu.sh "$VARIANT" /workspace/out/kernels-$VARIANT ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} || true
 ls -lh /workspace/out
 EOF
 
@@ -112,5 +130,5 @@ vastai copy "$ID":/workspace/out/ "local:$RESULTS_DIR/" || \
 
 echo ">> done. Reports in $RESULTS_DIR :"
 ls -lh "$RESULTS_DIR" || true
-echo ">> open locally:  nsys-ui $RESULTS_DIR/timeline-$VARIANT.nsys-rep ; ncu-ui $RESULTS_DIR/kernels-$VARIANT.ncu-rep"
+echo ">> open locally:  nsys-ui $RESULTS_DIR/timeline-$VARIANT.nsys-rep"
 # trap cleanup() destroys the instance now.
