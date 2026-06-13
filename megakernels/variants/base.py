@@ -25,6 +25,7 @@ class TrainVariant:
     fused_ce: bool          # fused linear-cross-entropy vs explicit logits
     ns_impl: str = "gram"   # newton-schulz variant for Muon
     custom_backward: bool = False
+    compile_mode: str | None = None  # torch.compile mode; 'reduce-overhead' = CUDAGraphs. None = pure eager
 
     # ---- lifecycle ----
     def setup(self) -> str:

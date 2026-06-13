@@ -42,14 +42,19 @@ def train(run: RunConfig, *, profile: bool = False, verbose: bool = True):
     loader = synthetic_loader(run.model.vocab_size, run.batch_size, run.seq_len,
                               device=device, seed=run.seed)
 
-    if run.compile:
-        model = torch.compile(model)
+    # torch.compile mode. The variant may request one (e.g. the cudagraph variant
+    # -> 'reduce-overhead', which replays the eager kernels via CUDAGraphs); the
+    # --compile flag is a manual override using default mode. Variant wins if both set.
+    compile_mode = variant.compile_mode or ("default" if run.compile else None)
+    if compile_mode is not None:
+        model = torch.compile(model, mode=compile_mode)
 
     if verbose:
         print(f"[{run.variant}] backend={backend} device={device} dtype={dtype} "
               f"params={model.num_params()/1e6:.1f}M "
               f"opt={'Muon+AdamW' if variant.use_muon else 'AdamW'} "
-              f"fused_ce={variant.fused_ce} custom_bwd={variant.custom_backward}",
+              f"fused_ce={variant.fused_ce} custom_bwd={variant.custom_backward} "
+              f"compile={compile_mode or 'off'}",
               flush=True)
 
     metrics = []

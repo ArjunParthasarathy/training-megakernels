@@ -5,18 +5,25 @@ training loop on rented H100s to find what to fuse next. CuTeDSL
 (`pip install nvidia-cutlass-dsl`) compiles one source for **Hopper (sm90)** and
 **Blackwell (sm100/sm120)**.
 
-## Three comparable training runs
+## Comparable training runs
 
 One shared eager architecture (`megakernels/model.py`); variants differ only in
-optimizer / kernel backend / backward pass, so a comparison isolates exactly that.
+optimizer / kernel backend / backward pass / graphing, so a comparison isolates
+exactly that.
 
 | variant | optimizer | kernels | backward | role |
 |---|---|---|---|---|
-| `baseline` | AdamW | eager (SDPA, explicit CE) | autograd | reference bar |
+| `baseline` (`eager`) | AdamW | eager (SDPA, explicit CE) | autograd | reference bar |
+| `cudagraph` | AdamW | same eager kernels, `torch.compile(mode="reduce-overhead")` | autograd | eager-but-graphed: isolates the per-launch overhead win |
 | `modded` | Muon (Gram-NS) + AdamW | CuTeDSL (eager fallback), fused CE | autograd | **also a baseline** |
 | `custom_backward` (`dev`) | same as modded | same | hand-written, more efficient | the experiment |
 
-`dev` is an alias for `custom_backward` (matches the dev branch).
+`eager` is an alias for `baseline` (pure eager, no compile/graphs); `dev` is an
+alias for `custom_backward` (matches the dev branch). `cudagraph` keeps the *same*
+kernels as `baseline` and only replays them via CUDAGraphs — it does **not** use
+`mode="max-autotune"`, which would also swap in autotuned Triton GEMMs and so
+confound the launch-overhead measurement with kernel selection. Any variant can be
+manually `torch.compile`d in default (non-graph) mode with `--compile`.
 
 ## Layout
 
