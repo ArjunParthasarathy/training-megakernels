@@ -1,0 +1,7 @@
+# Profiling target deps. The NGC pytorch image already ships torch + ncu + nsys;
+# you mainly need transformers for the Qwen3 model definition.
+transformers>=4.51   # Qwen3 support landed in 4.51
+# Optional CuTeDSL / fused-kernel stack (install on the H100, Linux only):
+#   pip install nvidia-cutlass-dsl     # CuTeDSL (CUDA 12.x); add [cu13] for CUDA 13
+#   pip install quack-kernels          # CuTeDSL RMSNorm / softmax / cross-entropy
+#   pip install flash-attn-4           # FlashAttention-4 (flash_attn.cute), Hopper+Blackwell
