@@ -6,7 +6,8 @@ their packages are installed; anything missing simply stays on the eager fallbac
 
   attention            -> flash-attn-4  (flash_attn.cute, GQA, fwd+bwd)
   rms_norm             -> Dao-AILab/quack
-  linear_cross_entropy -> quack cross-entropy (fused, no [N,vocab] materialization)
+  linear_cross_entropy -> stays EAGER: quack ships only cross_entropy over logits,
+                          not a fused linear-CE that absorbs the unembed matmul.
 """
 
 from __future__ import annotations
@@ -21,21 +22,26 @@ def _wire_flash_attn():
         # flash-attn expects [B, T, H, D]; model passes [B, H, T, D].
         q, k, v = (t.transpose(1, 2) for t in (q, k, v))
         o = flash_attn_func(q, k, v, causal=causal)
+        # flash-attn-4 (4.0.0bN) returns a tuple (out, lse, ...) even when
+        # return_lse is False; take the output tensor.
+        if isinstance(o, tuple):
+            o = o[0]
         return o.transpose(1, 2)
 
     register("attention", attention)
 
 
 def _wire_quack():
-    import quack  # type: ignore  # noqa: F401
-    from quack import rmsnorm as _rms, cross_entropy as _ce  # type: ignore
+    from quack import rmsnorm as _rms  # type: ignore
 
-    register("rms_norm", lambda x, weight, eps: _rms(x, weight, eps))
+    # quack.rmsnorm is (x, weight, bias, residual, ..., eps=1e-6, ...): eps is a
+    # KEYWORD, not the 3rd positional (that slot is `bias`). Passing eps positionally
+    # makes quack run bias.dim() on a float -> AttributeError. Pass eps by name.
+    register("rms_norm", lambda x, weight, eps: _rms(x, weight, eps=eps))
 
-    def linear_cross_entropy(hidden, weight, targets, ignore_index: int = -100):
-        return _ce(hidden, weight, targets, ignore_index=ignore_index)
-
-    register("linear_cross_entropy", linear_cross_entropy)
+    # linear_cross_entropy stays on the eager reference: quack only has cross_entropy
+    # over precomputed logits, which cannot fuse the unembed matmul, so there is no
+    # quack op to wire here (see module docstring).
 
 
 for _wire in (_wire_flash_attn, _wire_quack):

@@ -32,11 +32,21 @@ VARIANT="${1:-baseline}"; shift || true
 IMAGE="${IMAGE:-nvcr.io/nvidia/pytorch:25.01-py3}"
 DISK_GB="${DISK_GB:-64}"
 MAX_DPH="${MAX_DPH:-3.0}"
+# Minimum host-driver CUDA (nvidia-smi "CUDA Version"), via Vast's cuda_max_good.
+# The NGC pytorch:25.01 image ships the CUDA 12.8 toolkit and the cute stack
+# (nvidia-cutlass-dsl / flash-attn-4 / quack) JIT-compiles at runtime, so a host
+# whose driver caps below the toolkit risks the cute install/JIT failing (we drew a
+# 12.5 host and silently fell back to eager). Floor it to 12.6 with margin; raise
+# toward 12.8 to match the toolkit exactly, lower if no offers come back.
+MIN_CUDA="${MIN_CUDA:-12.6}"
 RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/results/$VARIANT-$(date +%Y%m%d-%H%M%S)}"
 EXTRA_ARGS=("$@")
 echo ">> profiling variant: $VARIANT"
 
-jqpy() { python3 -c "import sys,json; print(json.load(sys.stdin)$1)"; }
+# strict=False: Vast's --raw JSON sometimes contains literal control chars (e.g. in
+# an instance label/description), which json.load() rejects with
+# "Invalid control character at ..." — strict=False tolerates them.
+jqpy() { python3 -c "import sys,json; print(json.loads(sys.stdin.read(), strict=False)$1)"; }
 
 cleanup() {
   if [[ -n "${ID:-}" ]]; then
@@ -54,10 +64,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo ">> searching for a single H100_SXM offer under \$$MAX_DPH/hr ..."
+echo ">> searching for a single H100_SXM offer under \$$MAX_DPH/hr (cuda_max_good>=$MIN_CUDA) ..."
 OFFER=$(vastai search offers \
-  "gpu_name=H100_SXM num_gpus=1 rentable=true verified=true reliability>0.99 inet_down>1000 disk_space>$DISK_GB direct_port_count>=1 dph_total<$MAX_DPH" \
+  "gpu_name=H100_SXM num_gpus=1 rentable=true verified=true reliability>0.99 inet_down>1000 disk_space>$DISK_GB direct_port_count>=1 cuda_max_good>=$MIN_CUDA dph_total<$MAX_DPH" \
   -o 'dph' --raw | jqpy "[0]['id']")
+[[ -z "$OFFER" || "$OFFER" == "None" ]] && { echo "!! no H100_SXM offer matched (try lowering MIN_CUDA=$MIN_CUDA or raising MAX_DPH=$MAX_DPH)"; exit 1; }
 echo ">> selected offer $OFFER"
 
 echo ">> creating instance ..."
@@ -133,9 +144,18 @@ echo ">> running nsys (timeline) for variant=$VARIANT on the H100 ..."
 "${SSH[@]}" bash -s <<EOF
 set -e
 cd /workspace/repo
-# GPU-only fused-kernel stack (best-effort: cute backend if it installs, else eager)
-pip install -q nvidia-cutlass-dsl quack-kernels flash-attn-4 >/dev/null 2>&1 || true
 mkdir -p /workspace/out
+# Install + VERIFY the cute stack, fully logged (profiling/install_cute.sh) — this
+# replaces the old silent \`pip install ... >/dev/null 2>&1 || true\` that hid every
+# failure behind an eager fallback. \`if\` is exempt from \`set -e\`, so a non-zero
+# (cute unavailable) does NOT abort: we still profile (eager) and the install log +
+# train header say exactly why.
+echo "=== install + verify cute stack ==="
+if bash profiling/install_cute.sh /workspace/out/install-$VARIANT.log; then
+  echo ">> cute stack: AVAILABLE — profiling the cute backend"
+else
+  echo ">> cute stack: UNAVAILABLE — profiling EAGER fallback (see install-$VARIANT.log)"
+fi
 echo "=== nsys (timeline) ==="
 bash profiling/run_nsys.sh "$VARIANT" /workspace/out/timeline-$VARIANT ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} || true
 # ncu (per-kernel) intentionally disabled — see header. It needs GPU perf counters
@@ -153,7 +173,10 @@ mkdir -p "$RESULTS_DIR"
 # through Vast's SSH proxy (vastai_kaalia@host:65535), fails publickey, yet exits 0
 # — so it silently fetches nothing. Direct rsync is what works here; vastai copy is
 # only a last-ditch fallback.
-rsync -az -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $SSH_PORT" \
+# --timeout=120 --partial: the Vast SSH proxy intermittently stalls mid-transfer on
+# the larger artifacts (e.g. the multi-MB .sqlite), which used to hang the fetch
+# forever; bound it and keep partial progress so a retry/vastai-copy can finish.
+rsync -az --timeout=120 --partial -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $SSH_PORT" \
   "root@$SSH_HOST:/workspace/out/" "$RESULTS_DIR/" \
   || vastai copy "$ID":/workspace/out/ "local:$RESULTS_DIR/" || true
 

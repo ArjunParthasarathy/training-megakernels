@@ -28,9 +28,23 @@ class TrainVariant:
     compile_mode: str | None = None  # torch.compile mode; 'reduce-overhead' = CUDAGraphs. None = pure eager
 
     # ---- lifecycle ----
-    def setup(self) -> str:
-        """Activate this variant's kernel backend. Returns the resolved backend."""
+    def setup(self, *, require_cute: bool = False) -> str:
+        """Activate this variant's kernel backend. Returns the resolved backend.
+
+        If the variant asked for the cute backend ('auto'/'cute') but it resolved to
+        'eager', print *why* (cute.why_unavailable) instead of silently degrading —
+        the old behaviour produced an eager profile masquerading as a cute one. Pass
+        require_cute=True to make that fall-back a hard error instead of a warning.
+        """
         backend = kernels.set_backend(self.kernel_backend)
+        if self.kernel_backend in ("auto", "cute") and backend != "cute":
+            from .. import cute
+            why = cute.why_unavailable() or "unknown reason"
+            msg = (f"[{self.name}] requested kernel_backend={self.kernel_backend!r} "
+                   f"but resolved to EAGER — {why}")
+            if require_cute:
+                raise RuntimeError(msg + " (--require-cute)")
+            print("WARNING: " + msg, flush=True)
         if self.custom_backward:
             from .. import custom_backward as cb
             cb.install()

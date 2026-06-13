@@ -29,12 +29,13 @@ def _device_dtype():
     return "cpu", torch.float32
 
 
-def train(run: RunConfig, *, profile: bool = False, verbose: bool = True):
+def train(run: RunConfig, *, profile: bool = False, verbose: bool = True,
+          require_cute: bool = False):
     torch.manual_seed(run.seed)
     device, dtype = _device_dtype()
 
     variant = get_variant(run.variant)
-    backend = variant.setup()
+    backend = variant.setup(require_cute=require_cute)
 
     model = variant.build_model(run.model).to(device=device, dtype=dtype)
     model.train()
@@ -123,13 +124,15 @@ def main():
     p.add_argument("--tiny", action="store_true")
     p.add_argument("--compile", action="store_true")
     p.add_argument("--profile", action="store_true", help="cudaProfilerApi capture for nsys/ncu")
+    p.add_argument("--require-cute", action="store_true",
+                   help="hard-fail if a cute/auto variant falls back to eager (no silent degrade)")
     p.add_argument("--log", default="")
     args = p.parse_args()
     run = _build_run(args)
     # kernel backend override (variant default unless explicitly set)
     if args.kernels != "auto":
         get_variant  # variants set their own backend; --kernels forces it below
-    train(run, profile=args.profile)
+    train(run, profile=args.profile, require_cute=args.require_cute)
 
 
 if __name__ == "__main__":
