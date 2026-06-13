@@ -196,9 +196,10 @@ as a `nn.Module`/functional replacement. The rest of the model stays eager or
 
 ## 5. The profiling-driven development loop
 
-1. `python profiling/train_qwen3.py --tiny` locally → pipeline smoke test.
-2. `cd vast && ./launch.sh` → rent H100, profile baseline, fetch
-   `timeline.nsys-rep` + `kernels.ncu-rep`, auto-destroy.
+1. `pytest -q && python -m megakernels.compare --variants baseline modded dev --tiny`
+   locally → correctness + pipeline smoke test (CPU).
+2. `cd vast && ./launch.sh <variant>` → rent H100, profile that run, fetch
+   `timeline-<variant>.nsys-rep` + `kernels-<variant>.ncu-rep`, auto-destroy.
 3. Open `nsys-ui timeline.nsys-rep` → find the idle gaps + the kernels eating the
    step (expect: many small norm/RoPE/optimizer launches + the NS iteration chain).
 4. Open `ncu-ui kernels.ncu-rep` → confirm they're memory-/launch-bound (low warp

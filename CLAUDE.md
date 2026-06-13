@@ -1,96 +1,98 @@
 # training-megakernels
 
-Building **CuTeDSL megakernels for training** a Qwen3-1.7B-style model, and
-profiling that training loop on rented H100s to find what to fuse next.
+Building **CuTeDSL megakernels for training** a Qwen3-1.7B model, and profiling the
+training loop on rented H100s to find what to fuse next. CuTeDSL
+(`pip install nvidia-cutlass-dsl`) compiles one source for **Hopper (sm90)** and
+**Blackwell (sm100/sm120)**.
 
-CuTeDSL (`pip install nvidia-cutlass-dsl`) compiles one Python source for both
-**Hopper (sm90)** and **Blackwell (sm100/sm120)** — write the kernel once, run on
-either arch.
+## Three comparable training runs
+
+One shared eager architecture (`megakernels/model.py`); variants differ only in
+optimizer / kernel backend / backward pass, so a comparison isolates exactly that.
+
+| variant | optimizer | kernels | backward | role |
+|---|---|---|---|---|
+| `baseline` | AdamW | eager (SDPA, explicit CE) | autograd | reference bar |
+| `modded` | Muon (Gram-NS) + AdamW | CuTeDSL (eager fallback), fused CE | autograd | **also a baseline** |
+| `custom_backward` (`dev`) | same as modded | same | hand-written, more efficient | the experiment |
+
+`dev` is an alias for `custom_backward` (matches the dev branch).
 
 ## Layout
 
 | Path | What |
-|------|------|
-| `profiling/profile_utils.py` | warmup + `cudaProfilerApi` capture + NVTX `profile_step`/forward/backward/optimizer ranges. Wrap any loop with `profiled_loop(...)`. |
-| `profiling/train_qwen3.py` | self-contained Qwen3-1.7B profiling target (random init, synthetic data). Swap for the real nanochat/torchtitan loop later. |
-| `profiling/run_nsys.sh` | Nsight **Systems** timeline (launches, bubbles, overlap) → `.nsys-rep`. Run this FIRST. |
-| `profiling/run_ncu.sh` | Nsight **Compute** per-kernel (warp util, occupancy, memory) → `.ncu-rep`. Run on the few kernels nsys flagged. |
-| `profiling/fix_profiling_perms.sh` | fixes `ERR_NVGPUCTRPERM` so ncu can read perf counters. |
-| `vast/launch.sh` | one command: rent H100 → run nsys+ncu → fetch reports → **destroy**. |
-| `vast/onstart.sh` | boot script: enables counters + arms a self-destruct watchdog. |
-| `docs/PLAN.md` | the CuTeDSL kernel plan + baseline (modded-nanoGPT/nanochat) analysis. |
+|---|---|
+| `megakernels/model.py` | shared eager Qwen3 (GQA, QK-norm, RoPE, RMSNorm, SwiGLU, tied head) |
+| `megakernels/kernels/` | op dispatch: `eager.py` reference + cute hooks, backend-selectable |
+| `megakernels/cute/` | CuTeDSL kernels (GPU-only, import-guarded). `newton_schulz.py` = Gram-NS symmetric-GEMM; `wired.py` reuses quack/flash-attn-4 |
+| `megakernels/optim/muon.py` | Muon + Newton-Schulz (standard **and** Gram); 2D-only, 1D→AdamW |
+| `megakernels/custom_backward.py` | autograd.Functions with hand-written backward (the `dev` lever) |
+| `megakernels/variants/` | `baseline` / `modded` / `custom_backward` configs + registry |
+| `megakernels/train.py` | `python -m megakernels.train --variant <v>` (NVTX + cudaProfilerApi capture) |
+| `megakernels/compare.py` | run ≥2 variants on identical data/seed, print loss / step-ms / tok-s / mem |
+| `profiling/run_nsys.sh` `run_ncu.sh` | nsys timeline / ncu per-kernel, **take a variant arg** |
+| `vast/launch.sh` | rent H100 → profile a variant → download reports → **destroy** |
+| `docs/PLAN.md` | the CuTeDSL kernel roadmap + baseline analysis |
 
-## Profiler: two tools, two jobs
+## Local dev (CPU, no GPU needed)
 
-Your ask ("kernel launches, bubbles, warp utilization") spans **both** Nsight tools:
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+pytest -q                                              # 30 tests incl. Gram-NS ≡ standard-NS
+python -m megakernels.compare --variants baseline modded dev --tiny --max-steps 20
+```
+On CPU the cute backend falls back to eager and `modded` is *slower* (Muon's
+Newton-Schulz adds matmuls with no GPU to amortize) — the speedup is GPU-only and
+is what the Vast profiling run measures.
 
-- **kernel launches + bubbles/gaps** → Nsight **Systems** (`nsys`, timeline, cheap) → `.nsys-rep`
-- **warp utilization + occupancy + memory** → Nsight **Compute** (`ncu`, per-kernel, slow) → `.ncu-rep`
+## Profile a training run on Vast.ai  ← the one command
 
-Workflow: `nsys` first to find the idle gaps and the expensive kernels, then `ncu`
-scoped to just those. Both open in their respective local UIs (`nsys-ui`, `ncu-ui`).
-**Your local Nsight version must be ≥ the remote CLI version** or the report won't open.
-PyTorch's built-in `torch.profiler` emits Chrome/TensorBoard traces, **not** these
-formats — it won't open in Nsight Compute.
-
-`ncu --set full` replays every kernel 30–60× → can run for GPU-hours. The harness
-warms up `PROFILE_WARMUP` (default 10) steps then captures `PROFILE_STEPS` (default 3
-for nsys, forced to 1 for ncu) via the `profile_step` NVTX range, so a run is minutes.
-
-## Run a profiling job on Vast.ai (the short version)
-
-The Vast CLI handles search/create/destroy; one wrapper script chains it.
-
+One-time setup:
 ```bash
 pip install vastai
-vastai set api-key <YOUR_KEY>                      # stored in ~/.config/vastai/vast_api_key
-vastai create ssh-key ~/.ssh/id_ed25519.pub        # so the launcher can SSH in
-
-cd vast && ./launch.sh                              # rent H100 → profile → fetch → destroy
-#   ./launch.sh -- --tiny      # smoke-test the pipeline on a small/cheap GPU first
+vastai set api-key <YOUR_KEY>                          # ~/.config/vastai/vast_api_key
+vastai create ssh-key ~/.ssh/id_ed25519.pub
 ```
 
-`launch.sh`: searches the cheapest **verified single H100_SXM** under `MAX_DPH`
-($3.0/hr default, fast net), creates it with `onstart.sh`, waits until running,
-rsyncs `profiling/` up, runs `run_nsys.sh` + `run_ncu.sh`, copies
-`timeline.nsys-rep` / `kernels.ncu-rep` into `results/<timestamp>/`, then
-**`vastai destroy instance`** (an `EXIT` trap, so it fires even on error/Ctrl-C).
-`onstart.sh` also arms a `MAX_LIFETIME_SECS` (default 3600s) self-destruct
-watchdog as a billing backstop. Set `KEEP=1` to `stop` (keep disk) instead of
-destroy when iterating.
-
-Open results locally:
+Then, to profile a given run and pull the reports back to this machine:
 ```bash
-nsys-ui results/<ts>/timeline.nsys-rep
-ncu-ui  results/<ts>/kernels.ncu-rep
+cd vast && ./launch.sh <variant>        # variant = baseline | modded | dev
+#   e.g.  ./launch.sh modded
 ```
+`launch.sh` does it all: finds the cheapest verified single H100_SXM under
+`MAX_DPH` ($3/hr default), creates it, rsyncs the repo up, installs the cute stack,
+runs **both** `run_nsys.sh <variant>` (timeline) and `run_ncu.sh <variant>`
+(per-kernel), copies `timeline-<variant>.nsys-rep` + `kernels-<variant>.ncu-rep`
+into `results/<variant>-<ts>/`, then **`vastai destroy`** (an EXIT trap, fires even
+on error/Ctrl-C; `onstart.sh` also arms a `MAX_LIFETIME_SECS` self-destruct
+watchdog). `KEEP=1 ./launch.sh <variant>` uses `vastai stop` (keep disk) instead.
+
+Open locally (your Nsight version must be ≥ the remote CLI version):
+```bash
+nsys-ui results/<variant>-<ts>/timeline-<variant>.nsys-rep
+ncu-ui  results/<variant>-<ts>/kernels-<variant>.ncu-rep
+```
+
+### Profiler: two tools, two jobs
+- kernel launches + bubbles/gaps → Nsight **Systems** (`nsys`, cheap) → `.nsys-rep`
+- warp util + occupancy + memory → Nsight **Compute** (`ncu`, slow, scoped to the
+  `profile_step` NVTX range) → `.ncu-rep`
+
+`ncu --set full` replays each kernel 30–60×; the harness warms up then captures a
+couple of steps via `--profile` (cudaProfilerApi). `torch.profiler` emits
+Chrome/TensorBoard traces, **not** Nsight reports.
 
 ### Billing & ERR_NVGPUCTRPERM
-- `vastai stop instance <id>` halts compute but **still bills storage**;
-  `vastai destroy instance <id>` stops **all** billing. We destroy by default.
-- After any run: `vastai show instances` should be empty.
-- `ncu` needs GPU perf counters: host `NVreg_RestrictProfilingToAdminUsers=0`
-  **and** container `--cap-add=SYS_ADMIN` (set via a Vast **Template**'s Docker
-  options). Many multi-tenant hosts won't grant it — prefer **verified
-  whole-machine** hosts, or fall back to **nsys-only** (timeline tracing does
-  not need counters).
-
-### Cold-start tradeoff (fresh instance per job vs. reuse)
-- NGC image (`nvcr.io/nvidia/pytorch`, ~10–20 GB) ships ncu+nsys but pulls in
-  ~3–8 min on a fast host (filter `inet_down>1000`). Lean `pytorch/pytorch:*-runtime`
-  (~4–7 GB) pulls faster but needs extra installs.
-- **Fresh per job:** cleanest billing, pay only while running, but eat cold start
-  every run. **Reuse one instance:** no repeated cold start, but pay while idle.
-  **Middle ground:** `KEEP=1` → `vastai stop` keeps the image/disk cached (fast
-  restart, storage-only billing) while iterating; `destroy` when truly done.
-  A persistent **volume** keeps datasets/checkpoints across destroyed instances.
-
-## Local dev
-
-```bash
-pip install -r profiling/requirements.txt
-python profiling/train_qwen3.py --tiny --max-steps 20   # CPU/small-GPU smoke test
-```
+- `vastai destroy` stops **all** billing (default); `vastai stop` keeps disk and
+  still bills storage. After a run, `vastai show instances` should be empty.
+- `ncu` needs perf counters: host `NVreg_RestrictProfilingToAdminUsers=0` +
+  container `--cap-add=SYS_ADMIN` (Vast Template). Many multi-tenant hosts deny it
+  — prefer verified whole-machine hosts, or fall back to nsys-only (timeline
+  tracing needs no counters).
+- Cold start: NGC image (~10–20 GB, ships ncu+nsys) pulls in ~3–8 min on fast net
+  (`inet_down>1000`). Fresh-per-job = cleanest billing; `KEEP=1` (stop) keeps the
+  image cached for fast iteration.
 
 ## Commit conventions
 End commit messages with the Co-Authored-By trailer. Branch before committing on `main`.
