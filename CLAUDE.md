@@ -39,9 +39,18 @@ for nsys, forced to 1 for ncu) via the `profile_step` NVTX range, so a run is mi
 
 ## Run a profiling job on Vast.ai (the short version)
 
+> **⚠️ Always run local `vastai`/`launch.sh` commands inside the `vast` conda env.**
+> The `vastai` package uses `match`/`case` syntax that needs **Python ≥ 3.10**;
+> the base anaconda env is 3.9 and will crash with `SyntaxError: invalid syntax`
+> on import. Activate the dedicated env first, every time:
+> ```bash
+> conda activate vast        # Python 3.11 — created once via: conda create -n vast python=3.11 -y && pip install vastai
+> ```
+
 The Vast CLI handles search/create/destroy; one wrapper script chains it.
 
 ```bash
+conda activate vast                                # REQUIRED: vastai needs Python ≥3.10 (see warning above)
 pip install vastai
 vastai set api-key <YOUR_KEY>                      # stored in ~/.config/vastai/vast_api_key
 vastai create ssh-key ~/.ssh/id_ed25519.pub        # so the launcher can SSH in
