@@ -102,6 +102,19 @@ Vast.** Do **not** pass `--gpu-metrics-device` to nsys either — same counter w
 makes nsys exit with a usage error. `torch.profiler` emits Chrome/TensorBoard traces,
 **not** Nsight reports.
 
+### Use Vast's proxy SSH, not direct
+Connect/rsync over the **proxy** endpoint (`ssh_host`/`ssh_port` from
+`vastai show instance --raw`, e.g. `root@ssh3.vast.ai:25804`) — **not** the direct
+`vastai ssh-url` (`root@<public-ip>:<port>`). Direct ports are frequently
+unavailable (`direct_port_start: -1`) or take minutes to open even after the
+instance shows `running`, giving `Connection refused` / `Permission denied
+(publickey)` that aborts the run. The proxy (`ssh{N}.vast.ai`) is Vast's managed
+jump host and comes up reliably. `launch.sh` resolves the proxy and still probes it
+(`ssh … true` in a loop) before uploading, since even the proxy can lag a few
+seconds after `running` (Vast's own docs: "if authentication fails, try again after
+a few seconds"). It's a readiness race, **not** a key problem — verify the key once
+with `vastai show ssh-keys` vs `ssh-keygen -lf ~/.ssh/id_ed25519.pub`.
+
 ### Iterating on a bug: restart, don't recreate
 When a run fails on a **code/script bug** (not a dead host), don't destroy +
 re-rent — eat the cold start for nothing. Instead **reuse the same instance**:

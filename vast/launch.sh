@@ -92,12 +92,16 @@ for _ in $(seq 1 60); do
   sleep 10
 done
 
-# Resolve direct SSH endpoint.
-SSH_URL=$(vastai ssh-url "$ID")          # ssh://root@HOST:PORT
-SSH_HOST=$(echo "$SSH_URL" | sed -E 's#ssh://[^@]+@([^:]+):.*#\1#')
-SSH_PORT=$(echo "$SSH_URL" | sed -E 's#.*:([0-9]+)$#\1#')
+# Resolve SSH endpoint — use Vast's PROXY (ssh_host/ssh_port), NOT the direct
+# `vastai ssh-url`. Direct ports are often unavailable (direct_port_start=-1) or take
+# minutes to open even when the instance is `running`, causing "Connection refused"/
+# "Permission denied" that aborts the run; the proxy (ssh{N}.vast.ai) is Vast's
+# managed jump host and comes up reliably. See CLAUDE.md "Use proxy SSH".
+INST_JSON=$(vastai show instance "$ID" --raw)
+SSH_HOST=$(echo "$INST_JSON" | jqpy "['ssh_host']")
+SSH_PORT=$(echo "$INST_JSON" | jqpy "['ssh_port']")
 SSH=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p "$SSH_PORT" "root@$SSH_HOST")
-echo ">> ssh endpoint: root@$SSH_HOST:$SSH_PORT"
+echo ">> ssh endpoint (proxy): root@$SSH_HOST:$SSH_PORT"
 
 # From here on the instance is billing, so any failure should STOP (keep disk) — not
 # destroy — so we can restart + retry without re-renting (see CLAUDE.md). Remember
