@@ -10,23 +10,26 @@
 # Prereqs:  pip install vastai  &&  vastai set api-key <KEY>
 #           an SSH key registered:  vastai create ssh-key ~/.ssh/id_ed25519.pub
 #
-# Usage:  ./launch.sh [-- extra args forwarded to train_qwen3.py]
+# Usage:  ./launch.sh <variant> [-- extra args forwarded to megakernels.train]
+#   variant: baseline | modded | dev   (which training run to profile)
 #   Env knobs:
 #     IMAGE        docker image (default NGC pytorch, ships ncu+nsys)
 #     DISK_GB      instance disk (default 64)
 #     MAX_DPH      max $/hr to accept (default 3.0)
 #     KEEP         set =1 to `stop` (keep disk) instead of `destroy` at the end
-#     RESULTS_DIR  local dir for fetched reports (default ./results/<timestamp>)
-#     PROFILE_WARMUP / PROFILE_STEPS  forwarded to the profiler
+#     RESULTS_DIR  local dir for fetched reports (default ./results/<variant>-<ts>)
 set -euo pipefail
 cd "$(dirname "$0")"
 REPO_ROOT="$(cd .. && pwd)"
 
+VARIANT="${1:-baseline}"; shift || true
+[[ "${1:-}" == "--" ]] && shift || true
 IMAGE="${IMAGE:-nvcr.io/nvidia/pytorch:25.01-py3}"
 DISK_GB="${DISK_GB:-64}"
 MAX_DPH="${MAX_DPH:-3.0}"
-RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/results/$(date +%Y%m%d-%H%M%S)}"
+RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/results/$VARIANT-$(date +%Y%m%d-%H%M%S)}"
 EXTRA_ARGS=("$@")
+echo ">> profiling variant: $VARIANT"
 
 jqpy() { python3 -c "import sys,json; print(json.load(sys.stdin)$1)"; }
 
@@ -81,21 +84,23 @@ SSH_PORT=$(echo "$SSH_URL" | sed -E 's#.*:([0-9]+)$#\1#')
 SSH=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSH_PORT" "root@$SSH_HOST")
 echo ">> ssh endpoint: root@$SSH_HOST:$SSH_PORT"
 
-echo ">> uploading profiling/ code ..."
-rsync -az -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $SSH_PORT" \
-  "$REPO_ROOT/profiling/" "root@$SSH_HOST:/workspace/profiling/"
+echo ">> uploading repo (megakernels/ + profiling/) ..."
+rsync -az --exclude .venv --exclude .git --exclude results --exclude '__pycache__' \
+  -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $SSH_PORT" \
+  "$REPO_ROOT/" "root@$SSH_HOST:/workspace/repo/"
 
-echo ">> running nsys + ncu on the H100 ..."
+echo ">> running nsys + ncu for variant=$VARIANT on the H100 ..."
 "${SSH[@]}" bash -s <<EOF
 set -e
-cd /workspace/profiling
-pip install -q transformers >/dev/null 2>&1 || true
-bash fix_profiling_perms.sh || true
-export PROFILE_WARMUP="${PROFILE_WARMUP:-10}" PROFILE_STEPS="${PROFILE_STEPS:-3}"
+cd /workspace/repo
+# GPU-only fused-kernel stack (best-effort: cute backend if it installs, else eager)
+pip install -q nvidia-cutlass-dsl quack-kernels flash-attn-4 >/dev/null 2>&1 || true
+bash profiling/fix_profiling_perms.sh || true
+mkdir -p /workspace/out
 echo "=== nsys (timeline) ==="
-bash run_nsys.sh /workspace/out/timeline ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} || true
+bash profiling/run_nsys.sh "$VARIANT" /workspace/out/timeline-$VARIANT ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} || true
 echo "=== ncu (per-kernel) ==="
-PROFILE_STEPS=1 bash run_ncu.sh /workspace/out/kernels ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} || true
+bash profiling/run_ncu.sh "$VARIANT" /workspace/out/kernels-$VARIANT ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} || true
 ls -lh /workspace/out
 EOF
 
@@ -107,5 +112,5 @@ vastai copy "$ID":/workspace/out/ "local:$RESULTS_DIR/" || \
 
 echo ">> done. Reports in $RESULTS_DIR :"
 ls -lh "$RESULTS_DIR" || true
-echo ">> open locally:  nsys-ui $RESULTS_DIR/timeline.nsys-rep ; ncu-ui $RESULTS_DIR/kernels.ncu-rep"
+echo ">> open locally:  nsys-ui $RESULTS_DIR/timeline-$VARIANT.nsys-rep ; ncu-ui $RESULTS_DIR/kernels-$VARIANT.ncu-rep"
 # trap cleanup() destroys the instance now.

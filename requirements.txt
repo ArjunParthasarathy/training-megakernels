@@ -1,0 +1,12 @@
+# Core (CPU or GPU): the training stack itself only needs torch.
+torch>=2.4
+numpy
+
+# Local dev / CPU correctness suite
+pytest>=7
+
+# --- GPU-only fused-kernel stack (installed on the H100 by vast/launch.sh) ---
+# Linux + NVIDIA GPU only; the cute backend falls back to eager without these.
+#   pip install nvidia-cutlass-dsl     # CuTeDSL (CUDA 12.x); add [cu13] for CUDA 13
+#   pip install quack-kernels          # CuTeDSL RMSNorm / cross-entropy
+#   pip install flash-attn-4           # FlashAttention-4 (flash_attn.cute)
