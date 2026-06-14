@@ -11,6 +11,20 @@ set -uo pipefail
 
 MAX_LIFETIME_SECS="${MAX_LIFETIME_SECS:-3600}"  # hard cap: never bill past 1h by default
 
+# (0) KEYED ONSTART. Vast's proxy SSH has been rejecting our account key account-wide
+# (see CLAUDE.md / memory), and Vast also doesn't reliably populate the instance's
+# /root/.ssh/authorized_keys, so DIRECT SSH fails too. Fix: the launcher injects its
+# own pubkey here (replacing the LAUNCHER_PUBKEY line) and we append it to
+# authorized_keys ourselves, so direct SSH to the mapped 22/tcp port authenticates
+# regardless of Vast. Harmless when empty (proxy-only / un-injected use).
+LAUNCHER_PUBKEY=""   # <<< launch.sh rewrites this line with the real pubkey at create time
+if [[ -n "$LAUNCHER_PUBKEY" ]]; then
+  mkdir -p /root/.ssh && chmod 700 /root/.ssh
+  grep -qF "$LAUNCHER_PUBKEY" /root/.ssh/authorized_keys 2>/dev/null \
+    || echo "$LAUNCHER_PUBKEY" >> /root/.ssh/authorized_keys
+  chmod 600 /root/.ssh/authorized_keys
+fi
+
 # (1) best-effort perf-counter enable for Nsight Compute
 echo "options nvidia NVreg_RestrictProfilingToAdminUsers=0" \
   > /etc/modprobe.d/nvidia-profiler.conf 2>/dev/null || true

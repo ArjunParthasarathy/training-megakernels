@@ -71,11 +71,26 @@ OFFER=$(vastai search offers \
 [[ -z "$OFFER" || "$OFFER" == "None" ]] && { echo "!! no H100_SXM offer matched (try lowering MIN_CUDA=$MIN_CUDA or raising MAX_DPH=$MAX_DPH)"; exit 1; }
 echo ">> selected offer $OFFER"
 
+# Keyed onstart: inject our pubkey so DIRECT SSH authenticates even when Vast's proxy
+# key is broken account-wide and/or Vast never populates authorized_keys (see
+# onstart.sh step 0 + CLAUDE.md "proxy SSH" + memory). We rewrite the LAUNCHER_PUBKEY=
+# placeholder line in a temp copy and pass THAT to --onstart.
+KEY="${KEY_FILE:-$HOME/.ssh/id_ed25519}"
+PUBKEY_FILE="$KEY.pub"
+[[ -f "$PUBKEY_FILE" ]] || { echo "!! no pubkey at $PUBKEY_FILE (set KEY_FILE)"; exit 1; }
+PUBKEY="$(tr -d '\n' < "$PUBKEY_FILE")"
+KEYED_ONSTART="${CLAUDE_JOB_DIR:-/tmp}/onstart_keyed.sh"
+mkdir -p "$(dirname "$KEYED_ONSTART")"
+# '|' sed delim (the key contains /,+,= but no '|'); single-quote the key in-file.
+sed "s|^LAUNCHER_PUBKEY=.*|LAUNCHER_PUBKEY='$PUBKEY'|" onstart.sh > "$KEYED_ONSTART"
+grep -q "LAUNCHER_PUBKEY='ssh-" "$KEYED_ONSTART" || { echo "!! pubkey injection into onstart failed"; exit 1; }
+echo ">> keyed onstart written to $KEYED_ONSTART"
+
 echo ">> creating instance ..."
 ID=$(MAX_LIFETIME_SECS="${MAX_LIFETIME_SECS:-3600}" \
   vastai create instance "$OFFER" \
     --image "$IMAGE" --disk "$DISK_GB" --ssh --direct \
-    --onstart onstart.sh \
+    --onstart "$KEYED_ONSTART" \
     --raw | jqpy "['new_contract']")
 echo ">> instance id = $ID"
 
@@ -103,16 +118,23 @@ for _ in $(seq 1 60); do
   sleep 10
 done
 
-# Resolve SSH endpoint — use Vast's PROXY (ssh_host/ssh_port), NOT the direct
-# `vastai ssh-url`. Direct ports are often unavailable (direct_port_start=-1) or take
-# minutes to open even when the instance is `running`, causing "Connection refused"/
-# "Permission denied" that aborts the run; the proxy (ssh{N}.vast.ai) is Vast's
-# managed jump host and comes up reliably. See CLAUDE.md "Use proxy SSH".
+# Resolve SSH endpoint. CLAUDE.md historically preferred Vast's PROXY (ssh_host/
+# ssh_port), but the proxy has been rejecting our account key account-wide (memory:
+# vast-proxy-ssh-broken), so we now try BOTH transports and use whichever accepts our
+# key: proxy first (ssh{N}.vast.ai) for back-compat, then DIRECT (public_ipaddr + the
+# host port mapped to container 22/tcp) which works thanks to the keyed onstart above.
 INST_JSON=$(vastai show instance "$ID" --raw)
-SSH_HOST=$(echo "$INST_JSON" | jqpy "['ssh_host']")
-SSH_PORT=$(echo "$INST_JSON" | jqpy "['ssh_port']")
-SSH=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p "$SSH_PORT" "root@$SSH_HOST")
-echo ">> ssh endpoint (proxy): root@$SSH_HOST:$SSH_PORT"
+PROXY_HOST=$(echo "$INST_JSON" | jqpy "['ssh_host']")
+PROXY_PORT=$(echo "$INST_JSON" | jqpy "['ssh_port']")
+DIRECT_HOST=$(echo "$INST_JSON" | jqpy ".get('public_ipaddr')")
+# ports map: {'22/tcp': [{'HostPort': '12345', ...}]}; tolerate missing/empty.
+DIRECT_PORT=$(echo "$INST_JSON" | jqpy ".get('ports',{}).get('22/tcp',[{}])[0].get('HostPort')")
+echo ">> candidate endpoints: proxy root@$PROXY_HOST:$PROXY_PORT  direct root@$DIRECT_HOST:$DIRECT_PORT"
+
+# common ssh opts; -i + IdentitiesOnly so we only offer (and the host only checks) our
+# launcher key — avoids agent keys muddying the direct-endpoint auth.
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10
+          -i "$KEY" -o IdentitiesOnly=yes)
 
 # From here on the instance is billing, so any failure should STOP (keep disk) — not
 # destroy — so we can restart + retry without re-renting (see CLAUDE.md). Remember
@@ -121,21 +143,31 @@ echo ">> ssh endpoint (proxy): root@$SSH_HOST:$SSH_PORT"
 KEEP_DEFAULT="${KEEP:-0}"
 KEEP=1
 
-# Wait for sshd + key propagation before rsync. Vast prints the endpoint before the
-# container actually accepts the key, so an immediate rsync hits
-# "Permission denied (publickey)" and set -e would abort. Probe until it answers.
-echo ">> waiting for ssh to accept (key propagation) ..."
-SSH_OK=0
-for _ in $(seq 1 30); do
-  if "${SSH[@]}" -o BatchMode=yes true 2>/dev/null; then SSH_OK=1; break; fi
+# Probe both transports until one accepts the key (sshd + key propagation lag a few
+# seconds after `running`; direct ports can take minutes to open). First to answer wins.
+echo ">> probing ssh transports for key acceptance ..."
+SSH_HOST=""; SSH_PORT=""
+for _ in $(seq 1 36); do
+  if [[ -n "$PROXY_HOST" && "$PROXY_HOST" != "None" ]] \
+     && ssh "${SSH_OPTS[@]}" -o BatchMode=yes -p "$PROXY_PORT" "root@$PROXY_HOST" true 2>/dev/null; then
+    SSH_HOST="$PROXY_HOST"; SSH_PORT="$PROXY_PORT"; echo ">> using PROXY transport"; break
+  fi
+  if [[ -n "$DIRECT_HOST" && "$DIRECT_HOST" != "None" && -n "$DIRECT_PORT" && "$DIRECT_PORT" != "None" ]] \
+     && ssh "${SSH_OPTS[@]}" -o BatchMode=yes -p "$DIRECT_PORT" "root@$DIRECT_HOST" true 2>/dev/null; then
+    SSH_HOST="$DIRECT_HOST"; SSH_PORT="$DIRECT_PORT"; echo ">> using DIRECT transport"; break
+  fi
   sleep 5
 done
-[[ "$SSH_OK" == "1" ]] || { echo "!! ssh never accepted; instance kept ($ID) for inspection"; exit 1; }
+[[ -n "$SSH_HOST" ]] || { echo "!! no ssh transport accepted the key; instance kept ($ID) for inspection"; exit 1; }
+SSH=(ssh "${SSH_OPTS[@]}" -p "$SSH_PORT" "root@$SSH_HOST")
+SSH_E="ssh ${SSH_OPTS[*]} -p $SSH_PORT"   # for rsync -e (same opts/key/port)
+echo ">> ssh endpoint: root@$SSH_HOST:$SSH_PORT"
+SSH_OK=1
 
 echo ">> uploading repo (megakernels/ + profiling/) ..."
 for attempt in 1 2 3; do
   rsync -az --exclude .venv --exclude .git --exclude results --exclude '__pycache__' \
-    -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p $SSH_PORT" \
+    -e "$SSH_E" \
     "$REPO_ROOT/" "root@$SSH_HOST:/workspace/repo/" && break
   echo "   rsync upload attempt $attempt failed; retrying in 5s ..."; sleep 5
 done
@@ -155,6 +187,15 @@ if bash profiling/install_cute.sh /workspace/out/install-$VARIANT.log; then
   echo ">> cute stack: AVAILABLE — profiling the cute backend"
 else
   echo ">> cute stack: UNAVAILABLE — profiling EAGER fallback (see install-$VARIANT.log)"
+fi
+# For the modded (cute) variant, VALIDATE the hand-registered custom_op backwards
+# (quack rms_norm, flash-attn-4 attention) against the eager oracle before profiling —
+# these shipped GPU-UNVALIDATED (commits ffc370f, 0caa106). Log goes to /workspace/out
+# so it is fetched with the report; non-zero rc is recorded but does NOT abort the
+# profiling (\`|| true\`), so we still get the timeline either way.
+if [[ "$VARIANT" == "modded" || "$VARIANT" == "dev" ]]; then
+  echo "=== gradient match: cute custom_ops vs eager ==="
+  python -m profiling.verify_modded_grads 2>&1 | tee /workspace/out/gradcheck-$VARIANT.log || true
 fi
 echo "=== nsys (timeline) ==="
 bash profiling/run_nsys.sh "$VARIANT" /workspace/out/timeline-$VARIANT ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} || true
@@ -176,7 +217,7 @@ mkdir -p "$RESULTS_DIR"
 # --timeout=120 --partial: the Vast SSH proxy intermittently stalls mid-transfer on
 # the larger artifacts (e.g. the multi-MB .sqlite), which used to hang the fetch
 # forever; bound it and keep partial progress so a retry/vastai-copy can finish.
-rsync -az --timeout=120 --partial -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $SSH_PORT" \
+rsync -az --timeout=120 --partial -e "$SSH_E" \
   "root@$SSH_HOST:/workspace/out/" "$RESULTS_DIR/" \
   || vastai copy "$ID":/workspace/out/ "local:$RESULTS_DIR/" || true
 
