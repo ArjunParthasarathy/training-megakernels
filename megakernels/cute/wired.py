@@ -72,6 +72,32 @@ def _wire_flash_attn():
         B, H, T, _D = q.shape
         return torch.empty_like(q), q.new_empty((B, H, T), dtype=torch.float32)
 
+    # The backward must ALSO be an opaque custom op, not a bare _flash_attn_bwd call.
+    # register_autograd injects the backward into AOTAutograd's backward graph, so under
+    # torch.compile/reduce-overhead (the modded path) Dynamo *traces* it — and tracing
+    # into _flash_attn_bwd hits its dlpack/CuTeDSL .data_ptr() on a FakeTensor:
+    #   RuntimeError: Cannot access data pointer of Tensor (e.g. FakeTensor) ... wrap the
+    #   custom kernel into an opaque custom op.
+    # So we wrap the FA4 backward kernel the same way as the forward: an opaque op with a
+    # register_fake, which AOTAutograd keeps as one node (shapes via the fake kernel,
+    # kernel body never traced). Eager autograd calls it directly (grads validated by
+    # profiling/verify_modded_grads.py); compile sees an opaque node. dq/dk/dv take the
+    # shapes of q/k/v (dk/dv keep the GQA kv-head count).
+    @torch.library.custom_op("megakernels::cute_attention_bwd", mutates_args=())
+    def cute_attention_bwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                           out: torch.Tensor, grad_out: torch.Tensor, lse: torch.Tensor,
+                           causal: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dq, dk, dv = _flash_attn_bwd(
+            _to_flash(q), _to_flash(k), _to_flash(v),
+            _to_flash(out), _to_flash(grad_out), lse,
+            softmax_scale=None, causal=causal,
+        )
+        return _to_model(dq), _to_model(dk), _to_model(dv)
+
+    @cute_attention_bwd.register_fake
+    def _(q, k, v, out, grad_out, lse, causal):
+        return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
     def _setup_context(ctx, inputs, output):
         q, k, v, causal = inputs
         out, lse = output
@@ -79,16 +105,11 @@ def _wire_flash_attn():
         ctx.causal = causal
 
     def _backward(ctx, grad_out, grad_lse):
-        # grad_lse is ignored: lse is not consumed downstream (the dispatch wrapper
-        # drops it), so only grad_out flows. Call flash's own sm90 backward in flash
-        # layout, then map grads back to model layout.
+        # grad_lse is ignored: lse is not consumed downstream (the dispatch wrapper drops
+        # it), so only grad_out flows. Delegate to the opaque bwd op (see note above).
         q, k, v, out, lse = ctx.saved_tensors
-        dq, dk, dv = _flash_attn_bwd(
-            _to_flash(q), _to_flash(k), _to_flash(v),
-            _to_flash(out), _to_flash(grad_out), lse,
-            softmax_scale=None, causal=ctx.causal,
-        )
-        return _to_model(dq), _to_model(dk), _to_model(dv), None  # None: causal (bool)
+        dq, dk, dv = cute_attention_bwd(q, k, v, out, grad_out, lse, ctx.causal)
+        return dq, dk, dv, None  # None: causal (bool)
 
     cute_attention.register_autograd(_backward, setup_context=_setup_context)
 
