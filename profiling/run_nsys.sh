@@ -26,6 +26,20 @@ OUT="${1:-timeline-$VARIANT}"; shift || true
 # `WARMUP=<n> ./run_nsys.sh ...` or a trailing `--warmup <n>` (last value wins).
 WARMUP="${WARMUP:-15}"
 
+# CUDA graph trace granularity. nsys default (`graph`) collapses every captured
+# CUDAGraph into a *single* cudaGraphLaunch range on the timeline — so for the
+# `cudagraph` and `modded` variants (both torch.compile reduce-overhead =
+# CUDAGraphs) you see one opaque blob per replay, not the kernels inside it.
+# `node` traces each kernel node *within* the graph individually, so you can read
+# off exactly which kernels each capture contains (and their per-node timing).
+# We default to `node` for the graphed variants and leave eager variants on
+# `graph` (they capture no graphs, so node-tracing only adds overhead with no
+# payoff). Override with `CUDA_GRAPH_TRACE=graph|node ./run_nsys.sh ...`.
+case "$VARIANT" in
+  cudagraph|modded) CUDA_GRAPH_TRACE="${CUDA_GRAPH_TRACE:-node}" ;;
+  *)                CUDA_GRAPH_TRACE="${CUDA_GRAPH_TRACE:-graph}" ;;
+esac
+
 # --capture-range=cudaProfilerApi pairs with --profile in megakernels.train
 # (torch.cuda.profiler.start/stop) so only the post-warmup steps are recorded.
 # NOTE: no --gpu-metrics-device — that add-on needs GPU perf counters (SYS_ADMIN)
@@ -36,11 +50,12 @@ nsys profile \
   -w true \
   -t cuda,nvtx,osrt,cudnn,cublas \
   -s none \
+  --cuda-graph-trace="$CUDA_GRAPH_TRACE" \
   --capture-range=cudaProfilerApi --capture-range-end=stop \
   -o "$OUT" -f true -x true \
   python -m megakernels.train --variant "$VARIANT" --profile --warmup "$WARMUP" "$@"
 
-echo "Wrote ${OUT}.nsys-rep  (variant=$VARIANT)"
+echo "Wrote ${OUT}.nsys-rep  (variant=$VARIANT, cuda-graph-trace=$CUDA_GRAPH_TRACE)"
 nsys stats --report cuda_gpu_kern_sum "${OUT}.nsys-rep" 2>/dev/null | head -20 || true
 # host<->device transfer summaries (the other thing we care about): time + bytes
 # moved by HtoD/DtoH/DtoD memcpy, so transfer overhead shows up next to kernels.

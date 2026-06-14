@@ -95,6 +95,14 @@ We profile with Nsight **Systems** only — kernel launches, bubbles/gaps, and
 needs **no GPU perf counters**, so it runs on any host. `run_nsys.sh` also prints
 `cuda_gpu_mem_time_sum` / `cuda_gpu_mem_size_sum` so transfer cost shows next to kernels.
 
+For the graphed variants (`cudagraph`, `modded` — both `reduce-overhead` =
+CUDAGraphs), `run_nsys.sh` passes `--cuda-graph-trace=node`. nsys's default
+(`graph`) draws each captured graph as one opaque `cudaGraphLaunch` blob; `node`
+expands it into its individual kernel nodes, so you can see **exactly which kernels
+each capture contains** (and their per-node timing) in the timeline and in
+`cuda_gpu_kern_sum`. Eager variants stay on `graph` (no graphs to expand).
+Override per run with `CUDA_GRAPH_TRACE=graph|node ./run_nsys.sh <variant>`.
+
 Nsight **Compute** (`ncu`, per-kernel warp util/occupancy) is **disabled on purpose**
 — and on Vast it's effectively **impossible**, not just inconvenient. ncu needs GPU
 perf counters, which require `NVreg_RestrictProfilingToAdminUsers=0` on the host
