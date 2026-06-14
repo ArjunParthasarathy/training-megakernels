@@ -4,8 +4,10 @@ Per docs/PLAN.md, attention / RMSNorm / cross-entropy already have production
 CuTeDSL implementations. This module wires them into the dispatch registry when
 their packages are installed; anything missing simply stays on the eager fallback.
 
-  attention            -> flash-attn-4 (flash_attn.cute). Kept as flash's own
-                          differentiable call (NOT a torch custom op) — see below.
+  attention            -> flash-attn-4 (flash_attn.cute), wrapped as a torch
+                          custom_op returning (out, lse) + register_autograd over
+                          flash's _flash_attn_bwd. GPU-UNVALIDATED (CPU can't run
+                          flash_attn.cute) — see the !!! note in _wire_flash_attn.
   rms_norm             -> Dao-AILab/quack, wrapped as a torch.library.custom_op so
                           torch.compile/CUDAGraph (the `modded` reduce-overhead path)
                           treats it as one opaque-but-declared node instead of
@@ -29,28 +31,72 @@ from . import register
 
 
 def _wire_flash_attn():
-    from flash_attn.cute import flash_attn_func   # type: ignore
+    import torch
+    from flash_attn.cute import flash_attn_func          # type: ignore
+    # FA4's per-arch backward (FlashAttentionBackwardSm90 on Hopper) is reachable via
+    # the internal _flash_attn_bwd in flash_attn.cute.interface. If this import path
+    # changes, _wire_flash_attn raises and attention safely falls back to eager (the
+    # caller's try/except), rather than running with a wrong/missing backward.
+    from flash_attn.cute.interface import _flash_attn_bwd  # type: ignore
 
-    # NOTE: attention is not (yet) wrapped as a torch custom op. flash_attn_func is
-    # already differentiable through flash-attn's own autograd (FlashAttnFunc.apply ->
-    # _flash_attn_bwd; the sm90 backward IS shipped in the flash-attn-4 wheel and runs
-    # on our H100 — modded trains fine through it), so today it simply graph-breaks and
-    # becomes a CUDAGraph partition boundary: it runs eager while the norm/MLP/GEMM
-    # regions around it are captured. To also pull attention into the captured graph we
-    # can wrap it as a custom_op returning (out, lse) + register_autograd that calls
-    # flash's _flash_attn_bwd. That wiring (exact LSE shape for register_fake,
-    # _flash_attn_bwd signature) can't be validated on CPU (flash_attn.cute is GPU-only),
-    # so it is a deliberate follow-up to validate during the profiling run rather than a
-    # blind commit — a wrong backward would silently corrupt grads.
+    # !!! GPU-UNVALIDATED (written, not yet run on an H100). flash_attn.cute is GPU-only,
+    # so the pieces below cannot be exercised on CPU. Before relying on this, validate on
+    # an H100 that (1) flash_attn_func(..., return_lse=True) returns (out, lse) in this
+    # order, (2) the LSE shape assumed in register_fake matches, (3) _flash_attn_bwd's
+    # signature/return match, and (4) grads equal those from the plain differentiable
+    # flash_attn_func. See module docstring.
+
+    def _to_flash(t):   # model [B, H, T, D] -> flash [B, T, H, D]
+        return t.transpose(1, 2).contiguous()
+
+    def _to_model(t):   # flash [B, T, H, D] -> model [B, H, T, D]
+        return t.transpose(1, 2).contiguous()
+
+    @torch.library.custom_op("megakernels::cute_attention", mutates_args=())
+    def cute_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                       causal: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        # q:[B,H,T,D] k/v:[B,Hkv,T,D] (GQA handled by flash). return_lse=True so the
+        # backward has the softmax LSE. softmax_scale left at flash's default (1/sqrt(D)
+        # — matches the eager SDPA reference); the backward also uses the default so the
+        # two stay consistent.
+        res = flash_attn_func(_to_flash(q), _to_flash(k), _to_flash(v),
+                              causal=causal, return_lse=True)
+        o, lse = res[0], res[1]
+        return _to_model(o), lse
+
+    @cute_attention.register_fake
+    def _(q, k, v, causal):
+        # out takes q's [B,H,T,D] shape/dtype (GQA output has the query head count).
+        # ASSUMED LSE shape [B, H, T] (fp32) — FA's per-(batch,head,query) log-sum-exp;
+        # verify on GPU.
+        B, H, T, _D = q.shape
+        return torch.empty_like(q), q.new_empty((B, H, T), dtype=torch.float32)
+
+    def _setup_context(ctx, inputs, output):
+        q, k, v, causal = inputs
+        out, lse = output
+        ctx.save_for_backward(q, k, v, out, lse)
+        ctx.causal = causal
+
+    def _backward(ctx, grad_out, grad_lse):
+        # grad_lse is ignored: lse is not consumed downstream (the dispatch wrapper
+        # drops it), so only grad_out flows. Call flash's own sm90 backward in flash
+        # layout, then map grads back to model layout.
+        q, k, v, out, lse = ctx.saved_tensors
+        dq, dk, dv = _flash_attn_bwd(
+            _to_flash(q), _to_flash(k), _to_flash(v),
+            _to_flash(out), _to_flash(grad_out), lse,
+            softmax_scale=None, causal=ctx.causal,
+        )
+        return _to_model(dq), _to_model(dk), _to_model(dv), None  # None: causal (bool)
+
+    cute_attention.register_autograd(_backward, setup_context=_setup_context)
+
     def attention(q, k, v, causal: bool = True):
-        # flash-attn expects [B, T, H, D]; model passes [B, H, T, D].
-        q, k, v = (t.transpose(1, 2) for t in (q, k, v))
-        o = flash_attn_func(q, k, v, causal=causal)
-        # flash-attn-4 (4.0.0bN) returns a tuple (out, lse, ...) even when
-        # return_lse is False; take the output tensor.
-        if isinstance(o, tuple):
-            o = o[0]
-        return o.transpose(1, 2)
+        # dispatch entry: return only the output tensor (drop lse) so the model sees the
+        # same [B,H,T,D] tensor as before; autograd still flows through the custom op.
+        out, _lse = cute_attention(q, k, v, causal)
+        return out
 
     register("attention", attention)
 
