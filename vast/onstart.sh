@@ -19,9 +19,16 @@ MAX_LIFETIME_SECS="${MAX_LIFETIME_SECS:-3600}"  # hard cap: never bill past 1h b
 # regardless of Vast. Harmless when empty (proxy-only / un-injected use).
 LAUNCHER_PUBKEY=""   # <<< launch.sh rewrites this line with the real pubkey at create time
 if [[ -n "$LAUNCHER_PUBKEY" ]]; then
-  mkdir -p /root/.ssh && chmod 700 /root/.ssh
+  mkdir -p /root/.ssh
   grep -qF "$LAUNCHER_PUBKEY" /root/.ssh/authorized_keys 2>/dev/null \
     || echo "$LAUNCHER_PUBKEY" >> /root/.ssh/authorized_keys
+  # sshd StrictModes rejects the key ("bad ownership or modes for file
+  # .../authorized_keys") unless the WHOLE path is root-owned and not group/world-
+  # writable — including /root itself, which the Vast container often leaves g+w.
+  # Harden the full chain, not just the file (the bug that failed the first run).
+  chown root:root /root /root/.ssh /root/.ssh/authorized_keys
+  chmod go-w /root
+  chmod 700 /root/.ssh
   chmod 600 /root/.ssh/authorized_keys
 fi
 
