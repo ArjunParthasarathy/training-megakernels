@@ -67,10 +67,15 @@ def _wire_flash_attn():
     @cute_attention.register_fake
     def _(q, k, v, causal):
         # out takes q's [B,H,T,D] shape/dtype (GQA output has the query head count).
-        # ASSUMED LSE shape [B, H, T] (fp32) — FA's per-(batch,head,query) log-sum-exp;
-        # verify on GPU.
+        # CONTIGUOUS (memory_format) is REQUIRED: the real forward returns _to_model(o) =
+        # transpose(1,2).contiguous(), i.e. a contiguous [B,H,T,D]. A bare empty_like(q)
+        # would inherit q's (possibly transposed/non-contiguous) stride, so inductor traces
+        # the op's output stride wrong and assert_size_stride fires at CUDAGraph runtime
+        # ("expected ... stride 262144==128"). The fake's strides MUST match the real ones.
+        # ASSUMED LSE shape [B, H, T] (fp32) — FA's per-(batch,head,query) log-sum-exp.
         B, H, T, _D = q.shape
-        return torch.empty_like(q), q.new_empty((B, H, T), dtype=torch.float32)
+        return (torch.empty_like(q, memory_format=torch.contiguous_format),
+                q.new_empty((B, H, T), dtype=torch.float32))
 
     # The backward must ALSO be an opaque custom op, not a bare _flash_attn_bwd call.
     # register_autograd injects the backward into AOTAutograd's backward graph, so under
@@ -96,7 +101,14 @@ def _wire_flash_attn():
 
     @cute_attention_bwd.register_fake
     def _(q, k, v, out, grad_out, lse, causal):
-        return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        # CONTIGUOUS for the same reason as the forward fake: cute_attention_bwd returns
+        # _to_model(dq/dk/dv) = .contiguous(), so the fake must declare contiguous strides
+        # or inductor's traced backward mismatches the runtime layout (the assert_size_stride
+        # failure this fixed). dk/dv keep k/v's GQA kv-head count.
+        cf = torch.contiguous_format
+        return (torch.empty_like(q, memory_format=cf),
+                torch.empty_like(k, memory_format=cf),
+                torch.empty_like(v, memory_format=cf))
 
     def _setup_context(ctx, inputs, output):
         q, k, v, causal = inputs
