@@ -90,10 +90,31 @@ class Qwen3ForCausalLM(nn.Module):
             self.lm_head = None                                # ties to embed_tokens.weight
         else:
             self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self._compiled_backbone = None                         # set by compile_backbone()
 
     @property
     def head_weight(self) -> Tensor:
         return self.embed_tokens.weight if self.lm_head is None else self.lm_head.weight
+
+    def compile_backbone(self, mode: str | None) -> None:
+        """torch.compile ONLY the transformer backbone, leaving the CE loss eager.
+
+        We compile the backbone rather than the whole module (train.py used to do
+        torch.compile(model)) so the cross-entropy stays OUTSIDE the compiled region.
+        This is the apple/ml-cross-entropy + torchtune pattern: the fused linear-CE
+        (cut-cross-entropy, fused_ce=True) graph-BREAKS under torch.compile — its
+        impl="torch_compile" hits a data-dependent aten.nonzero, impl="cce" hits the
+        raw Triton autotuner/jit — so the reference integrations compile only the
+        model body and run the loss eagerly instead of forcing CE to be graph-clean.
+        With mode="reduce-overhead" the backbone (the bulk of the step: attention,
+        RMSNorm, SwiGLU, the cute drop-in kernels) is still CUDAGraph-replayed; only
+        the final CE node runs eager, so we keep the graphing win without fragmenting
+        the graph around — or tracing into — CCE. The explicit-CE path (fused_ce=False)
+        would compile cleanly either way; excluding it costs nothing and keeps one
+        compile boundary for both. Idempotent re-compile is fine (compile is cached).
+        """
+        self._compiled_backbone = self.backbone if mode is None else \
+            torch.compile(self.backbone, mode=mode)
 
     def backbone(self, input_ids: Tensor) -> Tensor:
         B, T = input_ids.shape
@@ -113,7 +134,11 @@ class Qwen3ForCausalLM(nn.Module):
         never materializes the [N, vocab] logits. fused_ce=False (baseline)
         computes explicit logits + F.cross_entropy.
         """
-        h = self.backbone(input_ids)
+        # Compiled backbone when compile_backbone() was called (the compile boundary
+        # is the backbone, NOT this forward — the CE below stays eager); plain backbone
+        # otherwise. This forward itself is never wrapped by torch.compile.
+        backbone = self._compiled_backbone or self.backbone
+        h = backbone(input_ids)
         if labels is None:
             logits = F.linear(h, self.head_weight)
             return {"loss": None, "logits": logits}

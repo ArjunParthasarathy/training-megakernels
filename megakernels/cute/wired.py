@@ -198,8 +198,12 @@ def _wire_cce():
         # truth (rel-L2 ~1.0, cos ~0.48) while eager-bf16 matches it (cos ~1.0), so it is a
         # real CCE bug, not bf16 rounding. CCE's impl="torch_compile" matches eager on ALL
         # of loss + grad_hidden + grad_weight (cos ~1.0000, rel ~2e-3) and still keeps the
-        # [N,vocab] logits off HBM (the peak-mem check passes). It is also the
-        # compile-friendly path under torch.compile(reduce-overhead) (the modded graph).
+        # [N,vocab] logits off HBM (the peak-mem check passes).
+        # This call runs EAGER, not under torch.compile: CCE graph-breaks (impl=
+        # "torch_compile" hits a data-dependent aten.nonzero, impl="cce" hits the Triton
+        # autotuner), so the modded variant compiles only the backbone and keeps the CE
+        # outside the graph — the apple/ml-cross-entropy + torchtune pattern. See
+        # Qwen3ForCausalLM.compile_backbone in model.py.
         return _cce(hidden, weight, targets, shift=0, reduction="mean",
                     ignore_index=ignore_index, impl="torch_compile")
 

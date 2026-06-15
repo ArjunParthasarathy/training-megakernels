@@ -46,9 +46,13 @@ def train(run: RunConfig, *, profile: bool = False, verbose: bool = True,
     # torch.compile mode. The variant may request one (e.g. the cudagraph variant
     # -> 'reduce-overhead', which replays the eager kernels via CUDAGraphs); the
     # --compile flag is a manual override using default mode. Variant wins if both set.
+    # We compile the BACKBONE only (model.compile_backbone), not the whole module, so
+    # the fused linear-CE (cut-cross-entropy) stays outside the graph — it graph-breaks
+    # under torch.compile, so the reference integrations keep the loss eager. See
+    # Qwen3ForCausalLM.compile_backbone. reduce-overhead still CUDAGraphs the backbone.
     compile_mode = variant.compile_mode or ("default" if run.compile else None)
     if compile_mode is not None:
-        model = torch.compile(model, mode=compile_mode)
+        model.compile_backbone(compile_mode)
 
     if verbose:
         print(f"[{run.variant}] backend={backend} device={device} dtype={dtype} "

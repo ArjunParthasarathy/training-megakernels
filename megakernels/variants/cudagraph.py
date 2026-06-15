@@ -7,7 +7,9 @@ no Muon, no CE fusion), but two things change together:
     These are *drop-in*: the dispatch signatures are identical to eager, so the
     module graph is unchanged — only the kernels behind ``kernels.attention`` /
     ``kernels.rms_norm`` differ.
-  * ``torch.compile(mode="reduce-overhead")`` replays the whole step via CUDAGraphs.
+  * ``torch.compile(mode="reduce-overhead")`` replays the **backbone** via CUDAGraphs
+    (backbone-only compile; the CE stays eager — see Qwen3ForCausalLM.compile_backbone.
+    cudagraph uses explicit CE so this is just where the one compile boundary lives).
 
 So this variant isolates "**CuTe drop-in kernels + graphing**" relative to the eager
 ``baseline`` — it is the bar that says how much the signature-compatible CuTe kernels
