@@ -39,7 +39,13 @@ MAX_DPH="${MAX_DPH:-3.0}"
 # 12.5 host and silently fell back to eager). Floor it to 12.6 with margin; raise
 # toward 12.8 to match the toolkit exactly, lower if no offers come back.
 MIN_CUDA="${MIN_CUDA:-12.6}"
-RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/results/$VARIANT-$(date +%Y%m%d-%H%M%S)}"
+# results/ is gitignored (large binary .nsys-rep/.sqlite), so a worktree's results
+# never reach the main checkout via git. But that main checkout is where the user
+# views them (their local dev branch). So fetch reports into the MAIN worktree's
+# results/ regardless of which worktree we launch from (porcelain lists it first).
+MAIN_WT="$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')"
+[[ -z "$MAIN_WT" ]] && MAIN_WT="$REPO_ROOT"   # not a git checkout / no worktrees -> here
+RESULTS_DIR="${RESULTS_DIR:-$MAIN_WT/results/$VARIANT-$(date +%Y%m%d-%H%M%S)}"
 EXTRA_ARGS=("$@")
 echo ">> profiling variant: $VARIANT"
 
