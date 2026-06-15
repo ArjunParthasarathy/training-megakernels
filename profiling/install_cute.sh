@@ -69,22 +69,49 @@ pip install --no-deps cut-cross-entropy 2>&1 | tee -a "$LOG" || log "## cut-cros
 # Belt-and-suspenders: --no-deps prevents a FRESH triton bump, but the NGC image ships
 # its triton as `pytorch_triton` (not `triton`), so torch has NO triton pin in its
 # metadata to restore from, and a triton already broken by an EARLIER run persists on a
-# KEEP=1 host. So FUNCTIONALLY test torch.compile's inductor backend: import the exact
-# module that the bad triton breaks (torch._inductor.runtime.hints, which does
-# `from triton.compiler.compiler import AttrsDescriptor` — removed in triton>=3.4). If it
-# fails, pin triton to 3.2.0 (the torch-2.6 pairing; still has AttrsDescriptor) and
-# re-check. (Verified 2026-06-15 on H100: triton 3.7.0 -> ImportError; ==3.2.0 -> OK.)
-log "=== verify torch.compile/inductor still imports (triton compat) ==="
-if ! python -c "import torch._inductor.runtime.hints" 2>>"$LOG"; then
-  log "## inductor import BROKEN (triton $(python -c 'import triton;print(triton.__version__)' 2>/dev/null) incompatible) -> pinning triton==3.2.0"
+# KEEP=1 host. So FUNCTIONALLY test torch.compile's inductor backend. The OLD check only
+# IMPORTED torch._inductor.runtime.hints — but that import is necessary-not-sufficient:
+# it can pass on a triton whose actual CODEGEN still fails, so a broken triton slipped
+# through and CCE's torch.compile backward (sort_logit_avg) only died later at gradcheck
+# time. Instead we run a REAL tiny torch.compile (fwd+bwd) on the GPU, which forces
+# inductor->triton codegen end-to-end and surfaces the breakage here, before profiling.
+# If it fails, pin triton to 3.2.0 (the torch-2.6 pairing; still has AttrsDescriptor,
+# removed in triton>=3.4) and re-probe. CPU-only hosts have no triton codegen path
+# (inductor uses its C++ backend there), so on CPU we keep the cheap import check — the
+# GPU run is the one that matters. (Verified 2026-06-15 on H100: triton 3.7.0 ->
+# ImportError under real compile; ==3.2.0 -> OK.)
+probe_inductor() {
+  python - 2>>"$LOG" <<'PY'
+import sys, torch
+if not torch.cuda.is_available():
+    import torch._inductor.runtime.hints  # noqa: F401  (CPU: no triton codegen to exercise)
+    sys.exit(0)
+try:
+    torch.compiler.reset()
+    @torch.compile
+    def f(x):
+        return (x * 2).relu().sum()
+    x = torch.randn(128, device="cuda", requires_grad=True)
+    f(x).backward()            # forces inductor->triton codegen for BOTH fwd and bwd
+    torch.cuda.synchronize()
+except Exception as e:
+    print(f"## inductor compile probe FAILED -> {type(e).__name__}: {e}", file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
+PY
+}
+tv() { python -c 'import triton;print(triton.__version__)' 2>/dev/null; }
+log "=== verify torch.compile/inductor actually codegens triton (real compile probe) ==="
+if ! probe_inductor; then
+  log "## inductor compile BROKEN (triton $(tv)) -> pinning triton==3.2.0"
   pip install --no-deps "triton==3.2.0" 2>&1 | tee -a "$LOG" || log "## triton==3.2.0 pin FAILED"
-  if python -c "import torch._inductor.runtime.hints" 2>>"$LOG"; then
-    log "## inductor import OK after triton==3.2.0"
+  if probe_inductor; then
+    log "## inductor compile OK after triton==3.2.0 (triton $(tv))"
   else
     log "## inductor STILL broken after triton==3.2.0 — torch.compile variants will fail"
   fi
 else
-  log "## inductor import OK (triton $(python -c 'import triton;print(triton.__version__)' 2>/dev/null) compatible)"
+  log "## inductor compile OK (triton $(tv))"
 fi
 
 # nvidia-cutlass-dsl has NO cuda pin, so the installs above greedily pull the LATEST
