@@ -14,16 +14,21 @@ exactly that.
 | variant | optimizer | kernels | backward | role |
 |---|---|---|---|---|
 | `baseline` (`eager`) | AdamW | eager (SDPA, explicit CE) | autograd | reference bar |
-| `cudagraph` | AdamW | same eager kernels, `torch.compile(mode="reduce-overhead")` | autograd | eager-but-graphed: isolates the per-launch overhead win |
-| `modded` | Muon (Gram-NS) + AdamW | CuTeDSL (eager fallback), fused CE | autograd | **also a baseline** |
+| `cudagraph` | AdamW | CuTeDSL **drop-in** (FA4 attn + quack RMSNorm, eager-compatible sigs), `torch.compile(reduce-overhead)` | autograd | isolates "CuTe drop-in kernels + graphing" |
+| `modded` | Muon (Gram-NS) + AdamW | CuTeDSL + **fused linear-CE (cut-cross-entropy)**, graphed | autograd | **max fusion; also a baseline** |
 | `custom_backward` (`dev`) | same as modded | same | hand-written, more efficient | the experiment |
 
 `eager` is an alias for `baseline` (pure eager, no compile/graphs); `dev` is an
-alias for `custom_backward` (matches the dev branch). `cudagraph` keeps the *same*
-kernels as `baseline` and only replays them via CUDAGraphs — it does **not** use
-`mode="max-autotune"`, which would also swap in autotuned Triton GEMMs and so
-confound the launch-overhead measurement with kernel selection. Any variant can be
-manually `torch.compile`d in default (non-graph) mode with `--compile`.
+alias for `custom_backward` (matches the dev branch). The ladder isolates one axis
+per rung: `baseline → cudagraph (+CuTe drop-in kernels +graphs) → modded (+Muon
++fused linear-CE) → dev (+custom backward)`. `cudagraph` stays eager-signature-
+compatible (AdamW, explicit CE) and only swaps in the drop-in CuTe kernels + graph
+replay; `modded` layers Muon and the genuine fused linear-CE on top (the
+`[N, vocab]` logits never materialize). No variant isolates *pure* launch overhead
+any more (the old `cudagraph` role) — that was an intentional re-tiering. We still
+avoid `mode="max-autotune"` so Inductor's Triton GEMM autotuning doesn't confound the
+comparison. Any variant can be manually `torch.compile`d in default (non-graph) mode
+with `--compile`.
 
 ## Layout
 

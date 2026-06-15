@@ -11,7 +11,7 @@ from megakernels.train import train
 from megakernels.variants import get_variant, list_variants
 
 
-@pytest.mark.parametrize("variant", ["baseline", "modded", "custom_backward"])
+@pytest.mark.parametrize("variant", ["baseline", "cudagraph", "modded", "custom_backward"])
 def test_variant_trains_a_few_steps(variant):
     run = RunConfig(variant=variant, seq_len=32, batch_size=2, max_steps=3,
                     warmup_steps=1, tiny=True, model=tiny())
@@ -35,3 +35,24 @@ def test_baseline_uses_adamw_modded_uses_muon():
     mod = get_variant("modded")
     assert base.use_muon is False
     assert mod.use_muon is True and mod.fused_ce is True
+
+
+def test_cudagraph_is_cute_dropin_with_graphs():
+    """cudagraph = CuTe drop-in kernels + CUDAGraphs, but eager-compatible:
+    AdamW (no Muon) and no CE fusion. It's the rung below modded."""
+    cg = get_variant("cudagraph")
+    assert cg.use_muon is False         # stays on AdamW like baseline
+    assert cg.fused_ce is False         # CE fusion is modded's job
+    assert cg.kernel_backend == "auto"  # CuTe on GPU, eager fallback on CPU
+    assert cg.compile_mode == "reduce-overhead"
+    assert cg.custom_backward is False
+
+
+def test_modded_is_max_fusion():
+    """modded = max fusion: Muon (Gram-NS) + cute backend + fused linear-CE + graphs."""
+    mod = get_variant("modded")
+    assert mod.use_muon is True
+    assert mod.fused_ce is True
+    assert mod.kernel_backend == "auto"
+    assert mod.ns_impl == "gram"
+    assert mod.compile_mode == "reduce-overhead"

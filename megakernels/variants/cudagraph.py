@@ -1,17 +1,23 @@
-"""CUDAGraph baseline: the eager model, but graphed.
+"""CUDAGraph variant: CuTeDSL drop-in kernels, eager-compatible signatures, graphed.
 
-Identical to ``baseline`` in every axis (plain AdamW, eager SDPA + explicit-logits
-CE, no Muon/CuTeDSL/fusion) except it wraps the model in
-``torch.compile(mode="reduce-overhead")``. That mode keeps the *same* kernels as
-eager but replays them via CUDAGraphs, collapsing the per-launch host overhead
-(the ~1.2us inter-kernel bubbles visible between the attention-backward kernels on
-an eager nsys timeline).
+Same architecture and optimizer as ``baseline`` (plain AdamW, explicit-logits CE,
+no Muon, no CE fusion), but two things change together:
+  * ``kernel_backend="auto"`` -> the CuTeDSL kernels on a GPU (FlashAttention-4
+    attention + quack RMSNorm, wired in ``cute/wired.py``), eager fallback on CPU.
+    These are *drop-in*: the dispatch signatures are identical to eager, so the
+    module graph is unchanged — only the kernels behind ``kernels.attention`` /
+    ``kernels.rms_norm`` differ.
+  * ``torch.compile(mode="reduce-overhead")`` replays the whole step via CUDAGraphs.
 
-This isolates exactly the launch-overhead win: it is the apples-to-apples
-"how much does graphing eager buy us" bar. We deliberately do *not* use
-``max-autotune`` here -- that adds Inductor's Triton-template autotuning, which
-substitutes different GEMM kernels and so would confound the launch-overhead
-effect with kernel selection.
+So this variant isolates "**CuTe drop-in kernels + graphing**" relative to the eager
+``baseline`` — it is the bar that says how much the signature-compatible CuTe kernels
+plus graph replay buy, *before* the modded variant layers on Muon + fused linear-CE.
+
+NOTE: with the CuTe kernels now in this variant, **no variant isolates pure launch
+overhead** any more (the old "graph the *eager* kernels" role). That was an
+intentional re-tiering: ``baseline -> cudagraph (+CuTe +graphs) -> modded (+Muon
++fused-CE) -> dev (+custom bwd)``. We still avoid ``max-autotune`` here so Inductor
+doesn't swap in different GEMM kernels and confound the comparison.
 """
 
 from __future__ import annotations
@@ -23,8 +29,8 @@ def make() -> TrainVariant:
     return TrainVariant(
         name="cudagraph",
         use_muon=False,
-        kernel_backend="eager",
-        fused_ce=False,
+        kernel_backend="auto",     # cute drop-in on GPU, eager on CPU
+        fused_ce=False,            # CE fusion is modded's job; stay eager-compatible
         custom_backward=False,
         compile_mode="reduce-overhead",
     )

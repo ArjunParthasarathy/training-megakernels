@@ -12,7 +12,10 @@ these up with no architecture change — keeping the comparison clean.
 Status:
   RMSNormFn   recompute rstd in backward (saves the normalized activation)  [done]
   SwiGLUFn    recompute sigmoid in backward (saves the product activation)  [done]
-  LinearCEFn  chunked logits so grad never materializes [N, vocab]          [TODO]
+  LinearCE    chunked logits so grad never materializes [N, vocab]          [done via CCE]
+              — supplied by apple cut-cross-entropy on the cute backend (see
+              cute/wired.py:_wire_cce); inherited here through the shared dispatch, so
+              no autograd.Function is hand-rolled in this module.
   AttentionFn flash-style recompute backward                                [TODO]
 
 The TODO ops stay on autograd's default backward until implemented, so the run is

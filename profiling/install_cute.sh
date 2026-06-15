@@ -53,6 +53,10 @@ pip install quack-kernels 2>&1 | tee -a "$LOG" || log "## quack-kernels: install
 # `pip install flash-attn-4` errors "No matching distribution found", so it needs --pre.
 log "=== pip install --pre flash-attn-4 (optional: wired attention; pre-release only) ==="
 pip install --pre flash-attn-4 2>&1 | tee -a "$LOG" || log "## flash-attn-4: install FAILED (non-fatal; attention stays eager)"
+# cut-cross-entropy backs the fused linear-CE (modded/dev fused_ce path); missing -> CE
+# stays eager (materializes logits). Separate line so its failure can't abort the others.
+log "=== pip install cut-cross-entropy (optional: wired fused linear-cross-entropy) ==="
+pip install cut-cross-entropy 2>&1 | tee -a "$LOG" || log "## cut-cross-entropy: install FAILED (non-fatal; linear-CE stays eager)"
 
 # nvidia-cutlass-dsl has NO cuda pin, so the installs above greedily pull the LATEST
 # cuda-python (13.x). But cuda-python 13's *base* wheel ships without the
@@ -71,7 +75,7 @@ else
 fi
 
 log "=== installed versions ==="
-pip list 2>/dev/null | grep -iE "cutlass|quack|flash" | tee -a "$LOG" || log "(none of cutlass/quack/flash installed)"
+pip list 2>/dev/null | grep -iE "cutlass|quack|flash|cut-cross-entropy|cut_cross_entropy" | tee -a "$LOG" || log "(none of cutlass/quack/flash/cce installed)"
 
 # The decisive check: the import that megakernels/cute/__init__.py runs. pipefail
 # makes the pipeline return python's exit code (not tee's 0), so the `if` is honest.

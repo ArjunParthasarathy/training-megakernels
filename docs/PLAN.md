@@ -109,8 +109,10 @@ the Nesterov-momentum update. modded-nanoGPT/nanochat's stock NS does **neither*
 ### P1 — Fused logits + cross-entropy (linear-CE) over 151936 vocab
 Fuse the tied unembedding GEMM with log-sum-exp/CE so the `[seq×151936]` logits
 never hit HBM (Apple cut-cross-entropy / Liger FLCE idea: 40–60% VRAM cut). CuTeDSL
-fit: excellent — GEMM with a custom reduction epilogue, its sweet spot. **QuACK**
-(`pip install quack-kernels`) already provides the CE primitive to build on. fwd+bwd.
+fit: excellent — GEMM with a custom reduction epilogue, its sweet spot. **Wired** to
+Apple **cut-cross-entropy** (`pip install cut-cross-entropy`), which absorbs the
+unembed matmul (fwd+bwd, vocab-chunked grad). Note **QuACK only ships CE over
+*precomputed* logits**, so it can't supply the fused linear-CE on its own — hence CCE.
 
 ### P2 — RMSNorm + residual (fwd+bwd)
 28 layers × (2 block norms) + final norm, each a separate launch; fusing

@@ -12,8 +12,10 @@ their packages are installed; anything missing simply stays on the eager fallbac
                           torch.compile/CUDAGraph (the `modded` reduce-overhead path)
                           treats it as one opaque-but-declared node instead of
                           graph-breaking on the CuTeDSL kernel.
-  linear_cross_entropy -> stays EAGER: quack ships only cross_entropy over logits,
-                          not a fused linear-CE that absorbs the unembed matmul.
+  linear_cross_entropy -> apple cut-cross-entropy (`cut_cross_entropy`). quack ships
+                          only cross_entropy over *precomputed* logits; CCE absorbs the
+                          unembed matmul so the [N, vocab] logits never hit HBM, and
+                          supplies its own chunked backward. See _wire_cce.
 
 Why custom_op + register_fake + register_autograd (rms_norm): under torch.compile,
 Dynamo can't trace into an opaque CuTeDSL kernel, so a bare call graph-breaks and
@@ -176,7 +178,29 @@ def _wire_quack():
     register("rms_norm", cute_rms_norm)
 
 
-for _wire in (_wire_flash_attn, _wire_quack):
+def _wire_cce():
+    # apple/ml-cross-entropy: fused linear + cross-entropy that absorbs the unembed
+    # matmul and keeps the [N, vocab] logits off HBM (cut-cross-entropy), with its own
+    # vocab-chunked backward. This is the `modded`/`dev` fused_ce path; quack has no
+    # equivalent, so we reuse CCE rather than hand-rolling the chunked kernel.
+    from cut_cross_entropy import linear_cross_entropy as _cce  # type: ignore
+
+    def linear_cross_entropy(hidden, weight, targets, ignore_index: int = -100):
+        # weight is the tied head [vocab, hidden] == CCE's `classifier`. We already do
+        # the next-token shift in model.py (h_shift / tgt), so shift=0 here. CCE returns
+        # a differentiable scalar loss and accumulates grad into `weight` — which, being
+        # the tied embed_tokens.weight, is the same Parameter the embedding lookup writes,
+        # so autograd sums the two grad paths with no special handling.
+        # impl="cce" is the fused Triton kernel; if it graph-breaks under
+        # torch.compile(reduce-overhead) on an H100, switch to impl="torch_compile"
+        # (CCE's compile-friendly variant) — verified via profiling/verify_modded_grads.py.
+        return _cce(hidden, weight, targets, shift=0, reduction="mean",
+                    ignore_index=ignore_index)
+
+    register("linear_cross_entropy", linear_cross_entropy)
+
+
+for _wire in (_wire_flash_attn, _wire_quack, _wire_cce):
     try:  # pragma: no cover - GPU only
         _wire()
     except Exception:  # noqa: BLE001 - package not installed -> eager fallback
