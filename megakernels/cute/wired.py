@@ -191,11 +191,17 @@ def _wire_cce():
         # a differentiable scalar loss and accumulates grad into `weight` — which, being
         # the tied embed_tokens.weight, is the same Parameter the embedding lookup writes,
         # so autograd sums the two grad paths with no special handling.
-        # impl="cce" is the fused Triton kernel; if it graph-breaks under
-        # torch.compile(reduce-overhead) on an H100, switch to impl="torch_compile"
-        # (CCE's compile-friendly variant) — verified via profiling/verify_modded_grads.py.
+        # impl="torch_compile" (NOT the default impl="cce"). Verified on an H100 via
+        # profiling/verify_modded_grads.py (2026-06-15): with the tied head [vocab,hidden]
+        # at vocab=151936, the default fused-Triton impl="cce" returns a WRONG grad_weight
+        # — loss + grad_hidden match eager, but grad_weight is ~orthogonal to the fp32
+        # truth (rel-L2 ~1.0, cos ~0.48) while eager-bf16 matches it (cos ~1.0), so it is a
+        # real CCE bug, not bf16 rounding. CCE's impl="torch_compile" matches eager on ALL
+        # of loss + grad_hidden + grad_weight (cos ~1.0000, rel ~2e-3) and still keeps the
+        # [N,vocab] logits off HBM (the peak-mem check passes). It is also the
+        # compile-friendly path under torch.compile(reduce-overhead) (the modded graph).
         return _cce(hidden, weight, targets, shift=0, reduction="mean",
-                    ignore_index=ignore_index)
+                    ignore_index=ignore_index, impl="torch_compile")
 
     register("linear_cross_entropy", linear_cross_entropy)
 
