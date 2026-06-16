@@ -57,7 +57,7 @@ def train(run: RunConfig, *, profile: bool = False, verbose: bool = True,
     if verbose:
         print(f"[{run.variant}] backend={backend} device={device} dtype={dtype} "
               f"params={model.num_params()/1e6:.1f}M "
-              f"opt={'Muon+AdamW' if variant.use_muon else 'AdamW'} "
+              f"opt={'Muon+AdamW' if variant.use_muon else ('AdamW(fused)' if variant.fused_optimizer else 'AdamW')} "
               f"fused_ce={variant.fused_ce} custom_bwd={variant.custom_backward} "
               f"compile={compile_mode or 'off'}",
               flush=True)

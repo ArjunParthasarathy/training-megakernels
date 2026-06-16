@@ -26,6 +26,7 @@ class TrainVariant:
     ns_impl: str = "gram"   # newton-schulz variant for Muon
     custom_backward: bool = False
     compile_mode: str | None = None  # torch.compile mode; 'reduce-overhead' = CUDAGraphs. None = pure eager
+    fused_optimizer: bool = False    # fused (capturable) AdamW; graphed when compile_mode='reduce-overhead'
 
     # ---- lifecycle ----
     def setup(self, *, require_cute: bool = False) -> str:
@@ -56,14 +57,47 @@ class TrainVariant:
     def build_optimizers(self, model: nn.Module, run: RunConfig):
         return build_optimizers(
             model, use_muon=self.use_muon, lr=run.lr, muon_lr=run.muon_lr,
-            weight_decay=run.weight_decay, ns_impl=self.ns_impl)
+            weight_decay=run.weight_decay, ns_impl=self.ns_impl,
+            fused=self.fused_optimizer)
 
     # ---- one optimization step (shared default) ----
+    def _graph_optimizer(self) -> bool:
+        """Whether to capture opt.step() into a CUDA graph this run.
+
+        Only when the variant opts into the fused optimizer AND the backbone is
+        reduce-overhead (CUDAGraphs) AND we're on CUDA. Off on CPU / eager so tests
+        and the baseline stay on the plain path. The compiled-optimizer recipe
+        (torch.compile(reduce-overhead) over opt.step) CUDA-graphs the update; with the
+        fused AdamW that is a single multi-tensor kernel, so the whole step graphs.
+        """
+        return (self.fused_optimizer and self.compile_mode == "reduce-overhead"
+                and torch.cuda.is_available())
+
+    def _optimizer_step(self, optimizers):
+        """Run the optimizer step, graphed when _graph_optimizer(). Cached compiled fn.
+
+        Under CUDA graphs the gradients must keep static addresses across replays, so
+        zero_grad uses set_to_none=False (zero in place) instead of dropping buffers.
+        """
+        if self._graph_optimizer():
+            step = getattr(self, "_compiled_opt_step", None)
+            if step is None:
+                def _raw_step():
+                    for opt in optimizers:
+                        opt.step()
+                step = self._compiled_opt_step = torch.compile(
+                    _raw_step, mode="reduce-overhead")
+            step()
+            for opt in optimizers:
+                opt.zero_grad(set_to_none=False)
+        else:
+            for opt in optimizers:
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+
     def training_step(self, model: nn.Module, optimizers, batch: torch.Tensor) -> dict:
         out = model(batch, labels=batch, fused_ce=self.fused_ce)
         loss = out["loss"]
         loss.backward()
-        for opt in optimizers:
-            opt.step()
-            opt.zero_grad(set_to_none=True)
+        self._optimizer_step(optimizers)
         return {"loss": float(loss.detach())}

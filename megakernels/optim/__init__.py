@@ -44,16 +44,23 @@ def split_params(model: nn.Module):
 
 
 def build_optimizers(model: nn.Module, *, use_muon: bool, lr: float, muon_lr: float,
-                     weight_decay: float, ns_impl: str = "gram"):
+                     weight_decay: float, ns_impl: str = "gram", fused: bool = False):
     """Build the optimizer set for a variant.
 
-    use_muon=False (baseline): a single AdamW over all params.
-    use_muon=True  (modded):   Muon over 2D hidden matrices + AdamW over the rest.
+    use_muon=False (baseline / modded / dev): a single AdamW over all params.
+    use_muon=True: Muon over 2D hidden matrices + AdamW over the rest (retired from the
+    shipped variants; the module is kept for the symmetric-GEMM kernel work).
     Returns a list of optimizers (call .step()/.zero_grad() on each).
+
+    fused=True requests the fused multi-tensor AdamW kernel. It is CUDA-only, so we
+    gate it on cuda availability (it raises on CPU). capturable is tied to the same
+    gate: it keeps the step counter on-device (no host sync), which is what lets the
+    optimizer step be captured into a CUDA graph (modded graphs opt.step()).
     """
     if not use_muon:
+        fused_ok = fused and torch.cuda.is_available()
         return [torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay,
-                                  betas=(0.9, 0.95))]
+                                  betas=(0.9, 0.95), fused=fused_ok, capturable=fused_ok)]
     muon_params, adamw_params = split_params(model)
     opts = [
         Muon(muon_params, lr=muon_lr, ns_impl=ns_impl),

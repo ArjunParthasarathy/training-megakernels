@@ -15,20 +15,28 @@ exactly that.
 |---|---|---|---|---|
 | `baseline` (`eager`) | AdamW | eager (SDPA, explicit CE) | autograd | reference bar |
 | `cudagraph` | AdamW | CuTeDSL **drop-in** (FA4 attn + quack RMSNorm, eager-compatible sigs), `torch.compile(reduce-overhead)` | autograd | isolates "CuTe drop-in kernels + graphing" |
-| `modded` | Muon (Gram-NS) + AdamW | CuTeDSL + **fused linear-CE (cut-cross-entropy)**, graphed | autograd | **max fusion; also a baseline** |
-| `custom_backward` (`dev`) | same as modded | same | hand-written, more efficient | the experiment |
+| `modded` | **AdamW(fused, graphed)** | CuTeDSL + **fused linear-CE (cut-cross-entropy)**, graphed | autograd | **max fusion; also a baseline** |
+| `custom_backward` (`dev`) | same as modded (fused AdamW, eager) | same | hand-written, more efficient | the experiment |
 
 `eager` is an alias for `baseline` (pure eager, no compile/graphs); `dev` is an
 alias for `custom_backward` (matches the dev branch). The ladder isolates one axis
-per rung: `baseline → cudagraph (+CuTe drop-in kernels +graphs) → modded (+Muon
-+fused linear-CE) → dev (+custom backward)`. `cudagraph` stays eager-signature-
-compatible (AdamW, explicit CE) and only swaps in the drop-in CuTe kernels + graph
-replay; `modded` layers Muon and the genuine fused linear-CE on top (the
-`[N, vocab]` logits never materialize). No variant isolates *pure* launch overhead
-any more (the old `cudagraph` role) — that was an intentional re-tiering. We still
-avoid `mode="max-autotune"` so Inductor's Triton GEMM autotuning doesn't confound the
-comparison. Any variant can be manually `torch.compile`d in default (non-graph) mode
-with `--compile`.
+per rung: `baseline → cudagraph (+CuTe drop-in kernels +graphs) → modded (+fused
+linear-CE +fused graphed optimizer) → dev (+custom backward)`. `cudagraph` stays
+eager-signature-compatible (plain AdamW, explicit CE) and only swaps in the drop-in
+CuTe kernels + graph replay; `modded` layers the genuine fused linear-CE (the
+`[N, vocab]` logits never materialize) and a **fused, CUDA-graphed `AdamW`** on top.
+**Muon was retired** (2026-06): the eager Muon + Gram-NS optimizer was ~58% of the
+step and there is no graph-able / widely-supported "FusedMuon" (native
+`torch.optim.Muon` is single-tensor and not capturable), so `modded`/`dev` now run
+`torch.optim.AdamW(fused=True, capturable=True)`, whose step is a single multi-tensor
+kernel that is captured into a CUDA graph alongside the backbone — the only eager
+regions left are CCE and the per-step boundary. The Muon module + Gram-NS
+symmetric-GEMM kernel are **kept in the tree** (`optim/muon.py`, `cute/newton_schulz.py`)
+for that kernel work, just not wired into a variant. No variant isolates *pure* launch
+overhead any more (the old `cudagraph` role) — that was an intentional re-tiering. We
+still avoid `mode="max-autotune"` so Inductor's Triton GEMM autotuning doesn't confound
+the comparison. Any variant can be manually `torch.compile`d in default (non-graph)
+mode with `--compile`.
 
 ## Layout
 
