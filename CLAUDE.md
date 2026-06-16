@@ -62,9 +62,11 @@ pip install -r requirements.txt
 pytest -q                                              # 30 tests incl. Gram-NS ≡ standard-NS
 python -m megakernels.compare --variants baseline modded dev --tiny --max-steps 20
 ```
-On CPU the cute backend falls back to eager and `modded` is *slower* (Muon's
-Newton-Schulz adds matmuls with no GPU to amortize) — the speedup is GPU-only and
-is what the Vast profiling run measures.
+On CPU the cute backend falls back to eager, fused AdamW falls back to plain AdamW,
+and the optimizer is not graphed — so all variants share the same AdamW math and
+run at roughly the same speed (loss curves are identical given the same seed/data).
+`modded`'s wins (cute kernels, CUDAGraph replay, fused graphed AdamW) are GPU-only and
+are what the Vast profiling run measures.
 
 ## Profile a training run on Vast.ai  ← the one command
 
